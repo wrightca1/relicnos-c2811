@@ -98,6 +98,10 @@ exec </dev/console >/dev/console 2>&1
 /bin/busybox mount -t vfat -o ro /dev/sda1 /mnt/flash 2>/dev/null \
     && /bin/busybox echo " flash: mounted read-only on /mnt/flash"
 
+# Loopback.  Nothing here needs it yet, but an interface that is DOWN will
+# surprise anything expecting 127.0.0.1 to work, and it costs one line.
+/bin/busybox ip link set lo up 2>/dev/null
+
 # NM-32A: the driver does the hardware at probe (microcode into all eight
 # CD2481s, 32 ttys, poll thread).  All that is left is the network and the
 # console server, so a freshly booted box answers on TCP 2000+port with no
