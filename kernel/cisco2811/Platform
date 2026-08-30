@@ -1,0 +1,8 @@
+#
+# Cisco 2811 Integrated Services Router (relicnos)
+#
+# Loaded by ROMMON, which copies each PROGBITS+ALLOC section to its sh_addr and
+# jumps e_entry (devices/c2811/notes/IMAGE_CONTAINER.md).  0x80100000 keeps the
+# kernel clear of the 0x8000f000 area ROMMON itself stages images through.
+#
+load-$(CONFIG_CISCO_2811)	+= 0xffffffff80100000

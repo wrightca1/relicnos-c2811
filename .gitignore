@@ -1,0 +1,13 @@
+# Cisco firmware: extracted locally from an IOS image you own, never committed.
+cd2481_ucode.bin
+cd2481_ucode.h
+nm_as16_fw.bin
+*.BIN
+
+# build products
+vmlinuz*
+initramfs.cpio.gz
+initramfs_root/
+*.o
+*.elf
+__pycache__/
