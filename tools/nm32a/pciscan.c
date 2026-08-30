@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /*
  * pciscan -- enumerate the Cisco 2811's two PCI buses from userspace.
  *

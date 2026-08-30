@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Dependency-free serial console driver (termios only).
 
 Written for the Cisco 2811 console, where

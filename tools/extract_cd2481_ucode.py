@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Extract the CD2481 microcode from a Cisco IOS image for the NM-32A.
 
 The CD2481 has no protocol code in ROM.  Its on-chip ROM only initialises

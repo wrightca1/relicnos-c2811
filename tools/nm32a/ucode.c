@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /*
  * ucode -- download the CD2481 microcode on the NM-32A.
  *

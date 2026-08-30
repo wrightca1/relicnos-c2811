@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /*
  * chan -- bring up one CD2481 channel and try a local-loopback byte.
  *

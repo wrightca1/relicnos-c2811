@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /*
  * nmconsole -- reverse-telnet server for the NM-32A's 32 async ports.
  *

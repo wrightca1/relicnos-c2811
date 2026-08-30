@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /*
  * poke -- write arbitrary physical memory, 8/16/32-bit.
  *

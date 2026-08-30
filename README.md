@@ -135,5 +135,14 @@ and unnecessary once the microcode is extracted.
 
 ## Licence
 
-Kernel sources are GPL-2.0, matching Linux. Userspace tools in `tools/` are
-GPL-2.0 as well.
+Permissive where it can be:
+
+| | |
+|---|---|
+| `tools/`, `docs/`, `initramfs/` | **MIT** |
+| `kernel/` | **GPL-2.0** — a Linux board port and driver is derivative work of the kernel and cannot be relicensed |
+| `firmware/` | Cisco's, extracted unmodified for interoperability; no claim made |
+
+Every file carries an SPDX identifier. See [`LICENSE`](LICENSE) for the detail,
+including why the kernel half is not MIT and why that is not a practical
+restriction for building, running, modifying or shipping this.

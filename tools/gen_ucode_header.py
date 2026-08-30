@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Turn an extracted cd2481_ucode.bin into the header the driver compiles in.
 
 Kept separate from the extractor so the licence-sensitive step (pulling Cisco

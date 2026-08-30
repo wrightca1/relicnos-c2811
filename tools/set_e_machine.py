@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Set the ELF e_machine field of a big-endian ELF32.
 
 Why this exists: every ELF the Cisco 2811 boot chain handles carries a

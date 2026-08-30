@@ -1,0 +1,38 @@
+relicnos-c2811 is licensed per directory.  In short: the userspace tools and
+documentation are MIT, and the kernel sources are GPL-2.0 because they have to
+be.
+
+  tools/, docs/, initramfs/, README.md      MIT          LICENSES/MIT.txt
+  kernel/                                   GPL-2.0      LICENSES/GPL-2.0.txt
+  firmware/                                 not ours     see firmware/README.md
+
+Every source file carries an SPDX-License-Identifier saying which applies.
+
+
+Why the kernel part is not permissive
+-------------------------------------
+
+kernel/cisco2811/ is a Linux board port and device driver.  It is compiled into
+the kernel, includes kernel headers, and calls internal kernel APIs, which
+makes it a derivative work of Linux; nm32a.c already declares
+MODULE_LICENSE("GPL").  It cannot be relicensed under permissive terms by us,
+and pretending otherwise would not help anyone downstream.
+
+This is the ordinary arrangement for out-of-tree drivers, and it is not a
+practical restriction for the intended use: build it, run it, modify it, ship
+appliances with it.  If you distribute a modified kernel you must offer the
+kernel source, which you would have to do for Linux itself regardless.
+
+The parts most likely to be reused elsewhere -- the microcode extractor, the
+console server, the register tools -- are all MIT and carry no such condition.
+
+
+firmware/
+---------
+
+firmware/cd2481_ucode.bin and firmware/nm_as16_fw.bin are Cisco firmware,
+extracted unmodified from an IOS image for interoperability: the CD2481 UARTs
+have no protocol code in ROM and the hardware does not function without the
+microcode.  They are not covered by either licence above and no claim is made
+over them.  tools/extract_cd2481_ucode.py reproduces the microcode from your
+own IOS image if you would rather not rely on the copy here.

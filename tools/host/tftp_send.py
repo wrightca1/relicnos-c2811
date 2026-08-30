@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Minimal TFTP *send* (read) server (RFC 1350 + 2347/2348/2349).
 
 The companion to tftp_recv.py: that one accepts an upload (device -> us, for pulling

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Dump memory off a Cisco 2811 through ROMMON's `dis` command.
 
 Why `dis`: this ROMMON's `dump` is behind the undocumented `priv`, IOS 12.4(24)T3

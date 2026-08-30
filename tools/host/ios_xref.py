@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Cross-reference strings to the code that uses them, in the decompressed IOS image.
 
 `ANALYSIS_METHOD.md` records that absolute-address cross-referencing "does not work" on

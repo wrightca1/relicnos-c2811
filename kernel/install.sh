@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
 # Install the Cisco 2811 board support into a Linux source tree.
 #
 # The board files live in THIS repo (cisco2811/) rather than only in a

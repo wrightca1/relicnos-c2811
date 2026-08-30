@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
 # Build a minimal BusyBox initramfs for relicnos first-boot-to-shell on the Cisco 2811.
 # Output: initramfs.cpio.gz -> bake into the kernel with
 #         CONFIG_INITRAMFS_SOURCE="<path to initramfs_root>", so no disk driver is

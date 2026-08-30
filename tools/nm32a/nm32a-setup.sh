@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
 # NM-32A bring-up and console server, for relicnos on the Cisco 2811.
 #
 # Everything the card needs is done by the kernel driver at probe: microcode
