@@ -5,8 +5,7 @@
 * a big-endian MIPS cross toolchain (`mips-linux-gnu-`)
 * Linux 6.6.x source
 * a static big-endian MIPS BusyBox
-* **an IOS image for your own 2811** -- the NM-32A microcode is extracted from
-  it at build time and is not distributed here
+* nothing else: the NM-32A microcode ships in `firmware/`
 
 ```
 sudo apt install gcc-mips-linux-gnu binutils-mips-linux-gnu
@@ -25,20 +24,25 @@ file busybox      # must say: ELF 32-bit MSB, MIPS, statically linked
 `MSB` matters.  The 2811 is mips-**be**; a little-endian BusyBox produces a
 kernel that boots and then goes silent at `Run /init as init process`.
 
-## 1. Extract the CD2481 microcode
+## 1. Generate the microcode header
 
-The card does nothing without it.  From an IOS image you possess:
+The card does nothing without the microcode; it ships in `firmware/`.
 
 ```
-./tools/extract_cd2481_ucode.py c2800nm-advipservicesk9-mz.124-24.T3.bin \
-    -o cd2481_ucode.bin
-./tools/gen_ucode_header.py cd2481_ucode.bin \
+./tools/gen_ucode_header.py firmware/cd2481_ucode.bin \
     -o kernel/cisco2811/cd2481_ucode.h
 ```
 
-The extractor locates the blob by its own signature -- a big-endian count of
-8192 followed by a payload whose tail is padded with the `0x1E000` fill IOS
-writes -- so it is not tied to one image version.  Expect:
+To reproduce the blob from your own IOS image instead:
+
+```
+./tools/extract_cd2481_ucode.py c2800nm-advipservicesk9-mz.124-24.T3.bin \
+    -o firmware/cd2481_ucode.bin
+```
+
+The extractor locates it by signature -- a big-endian count of 8192 followed by
+a payload whose tail is padded with the `0x1E000` fill IOS writes -- rather than
+a fixed address, so it is not tied to one image version.  Expect:
 
 ```
 found 1 candidate(s); using file offset 0x446ad70 (VA ~0x44479d10)
@@ -46,8 +50,7 @@ found 1 candidate(s); using file offset 0x446ad70 (VA ~0x44479d10)
   first: 26018 26008 23908 23808 24038 2C098
 ```
 
-Both generated files are in `.gitignore`: they are Cisco firmware, keep them
-local.
+The generated header is a build product and is gitignored.
 
 ## 2. Install the board port into a kernel tree
 

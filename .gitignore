@@ -1,7 +1,8 @@
-# Cisco firmware: extracted locally from an IOS image you own, never committed.
-cd2481_ucode.bin
+# The generated header is a build product -- regenerate it from firmware/.
 cd2481_ucode.h
-nm_as16_fw.bin
+
+# IOS images are not distributed here: 122 MB, past GitHub's file limit, and
+# unnecessary since the extracted microcode is in firmware/.
 *.BIN
 
 # build products

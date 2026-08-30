@@ -83,9 +83,10 @@ Software:
 ## Quick start
 
 ```
-# 1. microcode, from an IOS image you own (not distributed here)
-./tools/extract_cd2481_ucode.py <ios-image>.bin -o cd2481_ucode.bin
-./tools/gen_ucode_header.py cd2481_ucode.bin -o kernel/cisco2811/cd2481_ucode.h
+# 1. microcode header, from the firmware in this repo
+./tools/gen_ucode_header.py firmware/cd2481_ucode.bin \
+    -o kernel/cisco2811/cd2481_ucode.h
+# (or re-extract it yourself: tools/extract_cd2481_ucode.py <ios-image>.bin)
 
 # 2. board port into a kernel tree
 KDIR=~/linux-6.6.154 ./kernel/install.sh
@@ -116,15 +117,21 @@ FAT16), FastEthernet0/0, PCI, reboot, and all 32 NM-32A ports as
 Not done: the NM-32A interrupt is not wired, so the driver polls (1 ms while a
 port is open). USB, the crypto engine and the HWIC slots are untouched.
 
-## Firmware, and what is deliberately absent
+## Firmware
 
-The CD2481 microcode is **Cisco's firmware** and is not distributed here.
-`tools/extract_cd2481_ucode.py` pulls it out of an IOS image you already have
-for your own hardware; the extracted blob and the generated header are both
-in `.gitignore`.
+`firmware/cd2481_ucode.bin` is the CD2481 microcode, extracted from a Cisco IOS
+image. **The card is inert without it** — the UARTs have no protocol code in
+ROM, so this is what makes the hardware function and there is no substitute. It
+is unmodified, and `tools/extract_cd2481_ucode.py` will reproduce it byte-for-
+byte from your own IOS image if you would rather not trust the copy here.
 
-The FPGA image IOS carries (`nm_as16_fw`) is likewise absent, and is not needed
-— on this board revision the XC4013E configures itself from its own PROM.
+`firmware/nm_as16_fw.bin` is the FPGA image IOS carries. It is **not used** by
+this driver: on this board revision the XC4013E configures itself from its own
+PROM, and IOS only loads that image into the later V2 hardware. Included for
+reference. See `firmware/README.md`.
+
+IOS images themselves are not included — 122 MB, past GitHub's file size limit,
+and unnecessary once the microcode is extracted.
 
 ## Licence
 
