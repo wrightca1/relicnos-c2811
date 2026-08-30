@@ -57,6 +57,20 @@ experimental belongs behind a runtime trigger, not in probe.
 
 9600 8N1 on the RJ45 console port.
 
+```
+ssh -t <console-host> 'sudo screen /dev/ttyUSB2 9600'
+```
+
+Enter gives you a prompt; Ctrl-A then d detaches.
+
+The full BusyBox command set is available: `init` runs `busybox --install -s
+/bin` at boot, so `grep`, `ps`, `top`, `sed`, `awk`, `find`, `vi`, `ip`,
+`netstat`, `stty`, `telnet`, `wget` and the rest are real commands rather than
+needing a `busybox ` prefix.  Roughly 420 applets.
+
+`exit` is safe -- the shell is respawned rather than being pid 1 itself, so
+exiting hands you a fresh prompt instead of panicking the kernel.
+
 ## Bringing up the 32 async ports
 
 The driver does the hardware at probe: microcode into all eight CD2481s, 32

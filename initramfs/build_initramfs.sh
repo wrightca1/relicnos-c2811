@@ -24,8 +24,15 @@ cd "$(dirname "$0")"
 OUT=initramfs_root
 rm -rf "$OUT" && mkdir -p "$OUT"/{bin,sbin,dev,proc,sys,etc,mnt}
 cp "$BB" "$OUT/bin/busybox"
+# A minimal set, enough for init itself to run before busybox installs the rest.
+# Everything else is symlinked at boot by `busybox --install -s` (see init), which
+# covers every applet this busybox was actually built with rather than whichever
+# ones someone remembered to list here.  Hand-maintaining this list is how you end
+# up on the box without grep.
 for a in sh ls cat mount umount mknod insmod rmmod lsmod modprobe dmesg \
-         cttyhack setsid poweroff mdev uname; do ln -sf busybox "$OUT/bin/$a"; done
+         cttyhack setsid poweroff mdev uname ln mkdir; do
+    ln -sf busybox "$OUT/bin/$a"
+done
 
 # NOT a symlink: busybox `reboot` signals PID 1, and PID 1 here is a plain shell
 # that ignores it, so `reboot` silently does nothing.  `reboot -f` makes the
@@ -73,6 +80,11 @@ export PATH=/bin:/sbin
 # the kernel prints "unable to open an initial console". Everything echoed before
 # this line goes nowhere -- mounting devtmpfs above is not enough on its own.
 exec </dev/console >/dev/console 2>&1
+
+# Give ourselves the whole busybox command set: grep, ps, top, sed, awk, find,
+# vi, ip, netstat, stty, telnet, wget and the rest appear as real commands
+# instead of needing a `busybox ` prefix.
+/bin/busybox --install -s /bin 2>/dev/null
 /bin/busybox echo ""
 /bin/busybox echo "==================================================="
 /bin/busybox echo " RELICNOS IS ALIVE ON THE CISCO 2811"
@@ -100,7 +112,16 @@ if [ -c /dev/ttyNM0 ]; then
     /bin/nmconsole --base 2000 --ports 32 --speed 9600 >/nmconsole.log 2>&1 &
     /bin/busybox echo " NM-32A: 32 console ports on TCP 2000-2031 (port 16 = 2016)"
 fi
-exec /bin/busybox setsid cttyhack /bin/busybox sh
+# Respawn the shell instead of exec'ing it.  With `exec` the shell IS pid 1, so
+# typing `exit` kills init and the kernel panics with "Attempted to kill init".
+# Looping means exit just hands you a fresh prompt, which is what anyone typing
+# it actually expects.
+while :; do
+    /bin/busybox setsid cttyhack /bin/busybox sh
+    /bin/busybox echo ""
+    /bin/busybox echo "-- shell exited; starting another (this is pid 1, it cannot die) --"
+    /bin/busybox sleep 1
+done
 INIT
 cat > "$OUT/bin/bootios" <<'BOOTIOS'
 #!/bin/busybox sh

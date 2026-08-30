@@ -58,6 +58,12 @@ FastEthernet0/0.
 The NM-32A's interrupt is **not** wired up: the driver polls.  See
 `docs/NM32A.md`.
 
+Both onboard Ethernet ports are registered, `eth0` and `eth1`, on PHY addresses
+1 and 2.  Only `eth0`'s interrupt bit is confirmed by measurement; `eth1` uses
+the next bit by analogy with the old PowerPC mv64x60 numbering and has never
+been cabled here.  A wrong bit shows up as a port that transmits but never
+receives -- which is exactly what an earlier wrong guess did to `eth0`.
+
 ## The chassis, and where the console lives
 
 ```
@@ -67,8 +73,9 @@ The NM-32A's interrupt is **not** wired up: the driver polls.  See
         |   CON  o------------------------------------------- RJ45 console,
         |        (16550 at 0x1FA80000, 9600 8N1)                 9600 8N1
         |                                                       |
-        |   Fa0/0 o----------------------------------------- 10/100
-        |        (MV96340 MAC, mv643xx_eth)                      |
+        |   Fa0/0 o----------------------------------------- 10/100  eth0
+        |   Fa0/1 o----------------------------------------- 10/100  eth1
+        |        (MV96340 MACs, mv643xx_eth; PHY 1 and 2)         |
         |                                                       |
         |   +-----------------------------------------------+   |
         |   |  NM slot 1                                    |   |

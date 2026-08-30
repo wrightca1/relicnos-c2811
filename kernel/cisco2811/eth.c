@@ -128,15 +128,49 @@ static struct platform_device c2811_eth0_device = {
 };
 
 /*
- * Only Fa0/0 is registered.  Fa0/1 is port 1 at +0x2800 with the same shape,
- * but it has never been cabled during this work, so bringing it up would be
- * untestable -- and its MAC would need deriving from the cookie's
- * "MAC Address block size 24" range rather than invented.
+ * Fa0/1: the same shape as port 0, PHY address 2 (see cisco2811.h).
+ *
+ * The MAC follows Fa0/0's from the board's own block rather than being
+ * invented: Cisco allocates consecutive addresses to the onboard ports.
+ *
+ * The interrupt bit is a reasoned guess, not a measurement.  Bit 32 was
+ * confirmed as port 0 by watching the cause register while the port was
+ * pinged; the old PowerPC mv64x60 PIC numbered the Ethernet ports
+ * consecutively, so port 1 should be the next bit.  It has not been verified
+ * on the wire, because this port has never been cabled here -- with the link
+ * down the PHY should still be detected, which is the part worth checking.
  */
+static struct mv643xx_eth_platform_data c2811_eth1_pd = {
+	.shared		= &c2811_eth_shared_device,
+	.port_number	= C2811_ETH_PORT1,
+	.phy_addr	= MV643XX_ETH_PHY_ADDR(C2811_ETH_PHY_ADDR + 1),
+	.mac_addr	= { 0x00, 0x22, 0x55, 0x22, 0xc3, 0xa9 },
+};
+
+static struct resource c2811_eth1_resources[] = {
+	{
+		.name	= "eth1 irq",
+		.start	= C2811_MV_IRQ_BASE + CONFIG_CISCO2811_ETH_IRQ_BIT + 1,
+		.end	= C2811_MV_IRQ_BASE + CONFIG_CISCO2811_ETH_IRQ_BIT + 1,
+		.flags	= IORESOURCE_IRQ,
+	},
+};
+
+static struct platform_device c2811_eth1_device = {
+	.name		= MV643XX_ETH_NAME,
+	.id		= 1,
+	.num_resources	= ARRAY_SIZE(c2811_eth1_resources),
+	.resource	= c2811_eth1_resources,
+	.dev = {
+		.platform_data = &c2811_eth1_pd,
+	},
+};
+
 static struct platform_device *c2811_eth_devices[] __initdata = {
 	&c2811_eth_shared_device,
-	&c2811_mdio_device,		/* must exist before the port probes */
+	&c2811_mdio_device,		/* must exist before the ports probe */
 	&c2811_eth0_device,
+	&c2811_eth1_device,
 };
 
 static int __init c2811_eth_init(void)
