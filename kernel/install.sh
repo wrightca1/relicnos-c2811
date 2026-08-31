@@ -1,5 +1,4 @@
 #!/bin/bash
-# SPDX-License-Identifier: MIT
 # Install the Cisco 2811 board support into a Linux source tree.
 #
 # The board files live in THIS repo (cisco2811/) rather than only in a
@@ -189,7 +188,13 @@ CONFIG_EARLY_PRINTK=y
 # VGA console as tty0, and disables the serial bootconsole -- the board goes silent
 # mid-boot while still running perfectly.  CMDLINE_OVERRIDE makes it unconditional.
 CONFIG_CMDLINE_BOOL=y
-CONFIG_CMDLINE="console=ttyS0,9600"
+# panic=10   reboot ten seconds after a panic instead of sitting dead.  This is
+#            an unattended console server: a box that reboots itself beats one
+#            that needs someone at the PDU.
+# oops=panic an oops in the NM-32A poll thread otherwise leaves a half-working
+#            machine -- ttys registered, poll thread gone.  Better to take the
+#            reboot and come back in a known state.
+CONFIG_CMDLINE="console=ttyS0,9600 panic=10 oops=panic"
 CONFIG_CMDLINE_OVERRIDE=y
 # No video on this board; drop the VT layer so nothing can claim tty0.
 # CONFIG_VT is not set

@@ -31,6 +31,8 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/delay.h>
+#include <linux/mutex.h>
+#include <linux/sched.h>
 #include <linux/io.h>
 #include <asm/addrspace.h>
 #include <linux/ktime.h>
@@ -55,6 +57,8 @@
 #define GFRCR	0x81
 #define CAR	0xEE
 #define TPR	0xDA
+#define RTPRh	0x24
+#define RTPRl	0x25
 /* per channel */
 #define CMR	0x1B
 #define COR1	0x10
@@ -62,6 +66,9 @@
 #define COR3	0x16
 #define COR4	0x15
 #define COR5	0x14
+#define COR6	0x18
+#define COR7	0x07
+#define STCR	0x12
 #define CCR	0x13
 #define CSR	0x1A
 #define LIVR	0x09
@@ -77,9 +84,10 @@
 #define ARBCNT	0x4A
 #define ARBSTS	0x4F
 /* interrupt service */
-#define RPILR	0xE1
-#define TPILR	0xE3
-#define MPILR	0xE4
+#define RPILR	0xE1		/* Motorola column; Intel would be E3 */
+#define TPILR	0xE0		/* was 0xE3 -- that address is MPILR */
+#define MPILR	0xE3		/* was 0xE4 -- not a PILR at all */
+#define STK	0xE2
 #define TISR	0x8A
 #define TFTC	0x80
 #define RFOC	0x30
@@ -152,7 +160,74 @@
  * back, which is why the §104 scan -- which looked for LIVR in the returned
  * data -- read this very address and discarded it.
  */
-#define NM32A_ACK	0x000
+/*
+ * Interrupt acknowledge addresses.
+ *
+ * There is not ONE acknowledge address -- there are three.  Datasheet 5.2.2:
+ * RPILR/TPILR/MPILR "contain the value that will be present on the address bus
+ * during the interrupt acknowledge bus cycle for each type of interrupt", and
+ * the chip compares their bits 0-6 against A[0-6] to decide whether the
+ * acknowledge level is correct.  Present the wrong one and the chip simply does
+ * not answer: the read never retires and the machine stops dead.
+ *
+ * That is exactly what we were doing.  TPILR's address was wrong (0xE3 is
+ * MPILR in the Motorola column), so TPILR was never written and kept its
+ * default of 0x00 -- which is why acknowledging everything at BAR+0x000
+ * serviced TRANSMIT perfectly and hung the board the moment a RECEIVE request
+ * arrived.  Not a channel problem, as sec 119 supposed: a type problem.
+ */
+/*
+ * Acknowledge levels, taken from IOS.
+ *
+ * IOS's own card init at 0x40357930 programs the three PILRs to distinct
+ * values -- MPILR=3, TPILR=1, RPILR=2 -- and the level appears on A[6:0]
+ * during the acknowledge, so each type is acknowledged at its own address.
+ * Only the low two address bits appear to reach the chip on this card, which
+ * is why every IOS level fits in 0..3, and why our own experiment with
+ * TPILR=4 acknowledged at BAR+0x004 read back ff: 4 aliases to 0 and matched
+ * nothing.  BAR+0x000 only ever worked because TPILR's default is 0.
+ */
+/*
+ * Acknowledge level is a module parameter because the two candidate schemes
+ * were never compared with data actually flowing:
+ *
+ *   pilr=0  all three PILRs 0, one acknowledge at BAR+0x000.  This is the
+ *           address sec 108 proved, and the datasheet sanctions equal values
+ *           (the chip then prioritises internally, receive first).
+ *   pilr=1  IOS's levels -- RPILR=2, TPILR=1, MPILR=3 -- each acknowledged at
+ *           its own address.
+ *
+ * pilr=1 is stable but every received byte is garbage at every divisor, which
+ * looks more like a mis-established interrupt context than a timing error.
+ */
+static int pilr;
+module_param(pilr, int, 0644);
+MODULE_PARM_DESC(pilr, "0 = single acknowledge at +000, 1 = IOS per-type levels");
+
+#define NM32A_ACK_TX	(pilr ? 0x001 : 0x000)
+#define NM32A_ACK_RX	(pilr ? 0x002 : 0x000)
+#define NM32A_ACK_MD	(pilr ? 0x003 : 0x000)
+#define NM32A_ACK	NM32A_ACK_RX	/* legacy: the self-test paths */
+
+/*
+ * All three interrupt types share ONE acknowledge level.
+ *
+ * The datasheet's note under RPILR: "When each of the three Priority Interrupt
+ * Level registers is programmed with the same value, they are internally
+ * prioritized, with receive as the highest priority, followed by transmit and
+ * modem."  That is the model this driver already assumed -- one acknowledge,
+ * and the chip decides what to grant.
+ *
+ * It never worked for receive because RPILR was programmed 0x02 while the
+ * acknowledge was issued at BAR+0x000.  The chip compares the PILR against
+ * A[0-6] (5.2.2) and simply does not answer a level it does not recognise, so
+ * every receive request stalled the read and took the machine down, while
+ * transmit sailed through on TPILR's default of 0x00.  Eight power cycles and
+ * a channel theory came out of that one mismatched byte.
+ *
+ * Program all three to 0x00 to match the acknowledge address.
+ */
+
 
 #define NM32A_PORTS	0x800		/* IOS reads this for 16 vs 32 ports */
 #define NM32A_CTL	0x812
@@ -176,6 +251,9 @@ struct nm32a_port {
 	u8		tx[NM32A_TXBUF];
 	unsigned	head, tail;		/* tx ring */
 	spinlock_t	lock;
+	unsigned long	err_win;		/* start of the error window */
+	unsigned	err_cnt;		/* receive exceptions in it */
+	bool		rx_off;			/* receiver muted after a storm */
 };
 
 struct nm32a {
@@ -187,7 +265,7 @@ struct nm32a {
 	struct tty_driver	*tty;
 	struct nm32a_port	ports[NM32A_PORTS_N];
 	struct task_struct	*poller;
-	spinlock_t		hw_lock;	/* serialises CAR + service */
+	struct mutex		hw_lock;	/* serialises CAR + service */
 };
 
 /*
@@ -221,13 +299,38 @@ static void cwr16(struct nm32a *p, unsigned chip, unsigned reg, u16 v)
 	cwr(p, chip, reg + 1, v & 0xff);
 }
 
+/*
+ * Wait for the chip to accept a channel command.
+ *
+ * Bounded deliberately, and every caller checks the result.  A CD2481 that has
+ * lost its microcode never clears CCR, and an unbounded wait there turns one
+ * sick chip into a hung machine -- which is the wrong failure for a box whose
+ * whole job is serving 32 independent consoles.  One port degrading is
+ * acceptable; the other 31 going down with it is not.
+ */
+#define CCR_WAIT_MS	250
+
 static int ccr_wait(struct nm32a *p, unsigned chip)
 {
-	int n;
+	unsigned long end = jiffies + msecs_to_jiffies(CCR_WAIT_MS);
 
-	for (n = 0; n < 200000; n++)
+	/*
+	 * Bound this in TIME, not in iterations.  A count only bounds the work
+	 * if every read costs what you assumed; these are PCI reads to a card
+	 * that may be exactly the thing that is sick, and a stalled read makes
+	 * a 200000-iteration "bound" unbounded in wall clock.  hw_lock is a
+	 * mutex and every caller is process context, so yield while waiting --
+	 * a chip that never answers then costs one port, not the machine.
+	 */
+	do {
 		if (crd(p, chip, CCR) == 0)
 			return 0;
+		cond_resched();
+	} while (time_before(jiffies, end));
+
+	pr_warn_ratelimited(DRV ": chip %u: CCR stuck at %02x (GFRCR=%02x) -- "
+			    "channel command not accepted\n",
+			    chip, crd(p, chip, CCR), crd(p, chip, GFRCR));
 	return -ETIMEDOUT;
 }
 
@@ -333,6 +436,23 @@ static int nm32a_stage(struct nm32a *p, unsigned chip, unsigned chan, int stage)
 	cwr(p, chip, COR3, 0x02);	/* 1 stop bit */
 	cwr(p, chip, COR4, 0x08);
 	cwr(p, chip, COR5, 0x00);
+	/*
+	 * COR6/COR7/STCR must be written, not inherited.
+	 *
+	 * IOS loads a full channel image (0x00-0x1d at 0x4035f9a0) and sets all
+	 * three; we set neither, so a channel kept whatever the last owner left
+	 * -- and on this board the last owner is usually IOS.  In async mode
+	 * COR6 is the UNIX-tty helper: IgnCR/ICRNL/INLCF silently translate or
+	 * drop CR and NL, and ParMrk delivers an errored character prefixed with
+	 * FF 00.  COR7 strips the eighth bit and enables LNext processing.  Any
+	 * of those turns clean console text into convincing garbage, which is
+	 * indistinguishable from a baud error unless you know to look.
+	 *
+	 * Zero means: no translation, no marking, errors reported normally.
+	 */
+	cwr(p, chip, COR6, 0x00);
+	cwr(p, chip, COR7, 0x00);
+	cwr(p, chip, STCR, 0x00);		/* no special transmit command */
 	cwr(p, chip, DMR,  0x00);
 
 	cwr(p, chip, CCR, CCR_INITCH);
@@ -584,9 +704,9 @@ static void nm32a_find_iack(struct nm32a *p)
 	u8 v;
 
 	/* the chip rejects an IACK whose A[6:0] does not match a PILR */
-	cwr(p, chip, RPILR, 0x02);
-	cwr(p, chip, TPILR, 0x04);
-	cwr(p, chip, MPILR, 0x06);
+	cwr(p, chip, RPILR, NM32A_ACK_RX);
+	cwr(p, chip, TPILR, NM32A_ACK_TX);
+	cwr(p, chip, MPILR, NM32A_ACK_MD);
 
 	cwr(p, chip, CAR, 0);
 	cwr(p, chip, LIVR, IACK_LIVR);
@@ -1372,31 +1492,108 @@ static void nm32a_measure_baud(struct nm32a *p, unsigned chip, unsigned chan)
  * ------------------------------------------------------------------ */
 
 /*
- * Bit rates.  CLK measured at 35.08 MHz (§110); clk0 = CLK/8, clk1 = CLK/32.
+ * Bit rates, taken from IOS's own table (image vaddr 0x465814B0, 8-byte
+ * entries: u32 rate, u8 ClkSel, u8 divisor).
+ *
+ * ⚠ This corrects §110.  That section derived CLK = 35.08 MHz by timing a
+ * character, and every entry here contradicts it: IOS drives 4800 through
+ * 128000 from ClkSel 0 with divisor = 1152000/rate - 1, so clk0 is
+ * 1.152 MHz and CLK is 9.216 MHz -- a factor of 3.8 out.
+ *
+ * The old numbers were not obviously wrong because 9600 half-worked: sel 1
+ * with divisor 114 against a 1.152 MHz clk0 is 10105 baud, 5% fast, which a
+ * console tolerates in short bursts.  It fell apart at 115200, where the same
+ * error made the receiver ~3.8x too slow and collapsed a whole reply into a
+ * single byte -- a convincing impression of a protocol bug.
+ *
  * ClkSel sits in different bits in TCOR and RCOR (§113), which is what
- * TCOR_CLK()/RCOR_CLK() exist to keep straight.  clk0 cannot express 9600
- * (divisor 455 > 8 bits), so the low rates live on clk1.
+ * TCOR_CLK()/RCOR_CLK() exist to keep straight.
  */
 static const struct { unsigned rate; u8 sel, bpr; } nm32a_baud[] = {
-	{   1200, 1, 0xff }, {   2400, 1, 0xe3 }, {   4800, 1, 0x71 },
+	{   1200, 2, 0xe3 }, {   2400, 2, 0x71 }, {   4800, 1, 0xe3 },
 	{   9600, 1, 0x71 }, {  19200, 1, 0x38 }, {  38400, 0, 0x71 },
 	{  57600, 0, 0x4b }, { 115200, 0, 0x25 },
 };
 
+/*
+ * Runtime divisor override, for finding a rate empirically.
+ *
+ * Every rate this driver has ever PROVEN on the wire (9600 against the Arista,
+ * 19200) uses clk1.  clk0 -- which the table selects for 38400 and above -- has
+ * never once been confirmed to work on this card.  Rather than rebuild per
+ * guess, allow ClkSel and the divisor to be set directly and swept.
+ */
+/*
+ * Local loopback (TCOR bit 1, LLM).  Loops the transmitter back into the
+ * receiver inside the chip, so a rate can be verified with nothing plugged in:
+ * write a known pattern, read it back.  Every rate this driver has proven used
+ * clk1; clk0 -- which 38400 and above select -- has never been confirmed, and
+ * a receive that returns the same byte for every character looks exactly like a
+ * clock that is not what we think it is.
+ */
+/*
+ * RECEIVE-ONLY divisor override.
+ *
+ * fsel/fbpr move both directions at once, which confounds every sweep: get the
+ * transmit rate wrong and the far end stops replying, so "no bytes" says
+ * nothing about the receive setting.  These pin the receiver alone.
+ */
+static int frsel = -1;
+module_param(frsel, int, 0644);
+MODULE_PARM_DESC(frsel, "override RECEIVE ClkSel only, -1 = follow the rest");
+static int frbpr = -1;
+module_param(frbpr, int, 0644);
+MODULE_PARM_DESC(frbpr, "override RECEIVE divisor only, -1 = follow the rest");
+
+static int llm;
+module_param(llm, int, 0644);
+MODULE_PARM_DESC(llm, "1 = local loopback, for verifying a rate with no cable");
+
+static int fsel = -1;
+module_param(fsel, int, 0644);
+MODULE_PARM_DESC(fsel, "override ClkSel (0=CLK/8 1=/32 2=/128), -1 = use table");
+static int fbpr = -1;
+module_param(fbpr, int, 0644);
+MODULE_PARM_DESC(fbpr, "override bit-rate divisor, -1 = use table");
+
 static void nm32a_set_rate(struct nm32a *p, unsigned chip, unsigned rate)
 {
 	unsigned i, best = 3;			/* default 9600 */
+	u8 sel, bpr;
 
 	for (i = 0; i < ARRAY_SIZE(nm32a_baud); i++)
 		if (nm32a_baud[i].rate == rate) {
 			best = i;
 			break;
 		}
-	cwr(p, chip, TCOR, TCOR_CLK(nm32a_baud[best].sel));
-	cwr(p, chip, TBPR, nm32a_baud[best].bpr);
-	cwr(p, chip, RCOR, RCOR_CLK(nm32a_baud[best].sel));
-	cwr(p, chip, RBPR, nm32a_baud[best].bpr);
+	sel = (fsel >= 0) ? fsel : nm32a_baud[best].sel;
+	bpr = (fbpr >= 0) ? fbpr : nm32a_baud[best].bpr;
+	cwr(p, chip, TCOR, TCOR_CLK(sel) | (llm ? 0x02 : 0x00));
+	cwr(p, chip, TBPR, bpr);
+	cwr(p, chip, RCOR, RCOR_CLK(frsel >= 0 ? frsel : sel));
+	cwr(p, chip, RBPR, frbpr >= 0 ? frbpr : bpr);
 }
+
+/*
+ * Counters, not traces.  printk at 9600 costs ~1ms a line, which slows the poll
+ * loop enough to CAUSE the overruns it is meant to observe -- that has now
+ * misled this investigation twice.  Counting is free; read them afterwards.
+ */
+static unsigned long st_good, st_bytes, st_overrun, st_break, st_timeout, st_svc;
+module_param(st_good, ulong, 0644);
+module_param(st_bytes, ulong, 0644);
+module_param(st_overrun, ulong, 0644);
+module_param(st_break, ulong, 0644);
+module_param(st_timeout, ulong, 0644);
+module_param(st_svc, ulong, 0644);
+
+static int polldelay = 50;		/* 50us: measured overrun-free at 115200 */
+module_param(polldelay, int, 0644);
+MODULE_PARM_DESC(polldelay, "microseconds between sweeps while a port is open");
+
+static int rxthresh = 1;
+module_param(rxthresh, int, 0644);
+MODULE_PARM_DESC(rxthresh, "receive FIFO threshold, COR4[3:0]");
 
 static void nm32a_chan_init(struct nm32a *p, unsigned chip, unsigned chan,
 			    unsigned rate)
@@ -1408,15 +1605,62 @@ static void nm32a_chan_init(struct nm32a *p, unsigned chip, unsigned chan,
 	cwr(p, chip, COR1, 0x17);		/* 8 bits, no parity */
 	cwr(p, chip, COR2, 0x00);
 	cwr(p, chip, COR3, 0x02);		/* 1 stop bit */
-	cwr(p, chip, COR4, 0x01);		/* interrupt per character */
+	/*
+	 * Receive FIFO threshold, not one interrupt per character.
+	 *
+	 * COR4[3:0] is the threshold.  At 0x01 the chip demands a service for
+	 * every byte, and each service costs a mutex, an acknowledge, several
+	 * PCI register reads and an EOIR handshake -- so at 115200 the overhead
+	 * alone eats the 1.4ms a 16-byte FIFO gives us, and the tail of every
+	 * burst is lost to RISRl=08 (overrun).  A threshold of 8 cuts the
+	 * service count eightfold and leaves half the FIFO as headroom.
+	 *
+	 * A threshold on its own would strand the last few characters of a
+	 * burst, so pair it with the receive timeout: RTPR non-zero plus RET
+	 * (IER bit 5) raises a timeout interrupt when data stops with a
+	 * partially full FIFO, which is exactly the end of a console line.
+	 */
+	/*
+	 * Threshold 1, not 8.
+	 *
+	 * A threshold only pays off if the timeout reliably flushes what is
+	 * left below it, and the receive timer here does not fire -- so the
+	 * tail of every burst shorter than the threshold was stranded, which
+	 * is why a 23-character prompt arrived as exactly 16 bytes and
+	 * "login: " never came.  Interrupting per character costs more
+	 * services, but the poll loop now drains a chip until it is empty and
+	 * does not sleep after doing work, which is what made the old
+	 * per-character threshold overrun.
+	 */
+	cwr(p, chip, COR4, rxthresh & 0x0f);
+	cwr(p, chip, RTPRh, 0x00);
+	cwr(p, chip, RTPRl, 0x20);		/* flush a partial FIFO when idle */
 	cwr(p, chip, COR5, 0x00);
+	/*
+	 * These three must be written on every channel init, not inherited.
+	 * IOS loads a full channel image (0x4035f9a0); we set none of them, so
+	 * a channel kept whatever the previous owner left -- and on this board
+	 * that is usually IOS.  COR6 is the UNIX-tty helper (IgnCR/ICRNL/INLCF
+	 * translate or drop CR and NL; ParMrk prefixes an errored character
+	 * with FF 00) and COR7 strips the eighth bit -- any of which turns
+	 * clean console text into convincing garbage.
+	 */
+	cwr(p, chip, COR6, 0x00);		/* no CR/NL translation or marking */
+	cwr(p, chip, COR7, 0x00);		/* no 8th-bit strip, no LNext */
+	cwr(p, chip, STCR, 0x00);		/* no special transmit command */
+	/*
+	 * TPR clocks the receive timeout we enabled above (RTPR + RET).  It is
+	 * CLK/2048 and the datasheet requires at least 0x10 for the timer to
+	 * keep accuracy -- about a 1 ms tick.
+	 */
+	cwr(p, chip, TPR, 0x40);
 	cwr(p, chip, CCR, CCR_INITCH);
 	ccr_wait(p, chip);
 	cwr(p, chip, CCR, CCR_ENTX | CCR_ENRX);
 	ccr_wait(p, chip);
 	cwr(p, chip, MSVR_RTS, 0x01);
 	cwr(p, chip, MSVR_DTR, 0x02);
-	cwr(p, chip, IER, 0x09);		/* RxD | TxD -- required (§109) */
+	cwr(p, chip, IER, 0x29);		/* RET | RxD | TxD (§109) */
 }
 
 /*
@@ -1428,10 +1672,23 @@ static void nm32a_chan_init(struct nm32a *p, unsigned chip, unsigned chan,
  * accesses at the wrong channel and loses characters.  Keeping every chip
  * access in this one thread removes the race by construction.
  */
+/*
+ * Re-arm transmit interest for any channel with queued bytes.
+ *
+ * This MUST hold hw_lock.  CAR is per-CHIP channel-select state, and this
+ * function sets it -- so without the lock it races the tty paths, which set
+ * CAR and then issue channel commands against it.  A CCR command that lands
+ * on the wrong channel (or on a channel mid-service) is exactly how a CD2481
+ * gets wedged, and a wedged chip stops answering PCI reads: the CPU then
+ * stalls inside the load instruction, where no software watchdog can reach it.
+ * That is a machine you can only recover at the rack, so the lock is not
+ * optional here.
+ */
 static void nm32a_arm_tx(struct nm32a *p, unsigned chip)
 {
 	unsigned c;
 
+	mutex_lock(&p->hw_lock);
 	for (c = 0; c < 4; c++) {
 		struct nm32a_port *np = &p->ports[chip * 4 + c];
 		bool pending;
@@ -1442,8 +1699,9 @@ static void nm32a_arm_tx(struct nm32a *p, unsigned chip)
 		if (!pending)
 			continue;
 		cwr(p, chip, CAR, c);
-		cwr(p, chip, IER, 0x09);		/* RxD | TxD */
+		cwr(p, chip, IER, np->rx_off ? 0x01 : 0x29);	/* RET | RxD | TxD */
 	}
+	mutex_unlock(&p->hw_lock);
 }
 
 /*
@@ -1459,47 +1717,311 @@ static void nm32a_arm_tx(struct nm32a *p, unsigned chip)
  * So: look before, acknowledge once, look again.  Whichever enable bit dropped
  * is the service we are actually in, and only that one is serviced.
  */
-static void nm32a_service(struct nm32a *p, unsigned chip)
+/*
+ * A port with nothing plugged into it generates receive exceptions forever.
+ * Servicing them costs the poll thread real time, and this box exists to serve
+ * 31 OTHER consoles -- so after a sustained storm, mute this channel's receiver
+ * and say so.  Transmit is left alone, and the next open clears the mute.
+ */
+
+
+static int trace;
+module_param(trace, int, 0644);
+MODULE_PARM_DESC(trace, "trace this many service passes to the console");
+
+#define NM32A_ERR_WINDOW	HZ		/* accounting window */
+#define NM32A_ERR_LIMIT		200		/* exceptions/window before muting */
+
+static void nm32a_rx_exception(struct nm32a *p, unsigned chip, unsigned chan,
+			       u8 risr)
+{
+	struct nm32a_port *np = &p->ports[chip * 4 + chan];
+
+	if (time_after(jiffies, np->err_win + NM32A_ERR_WINDOW)) {
+		np->err_win = jiffies;
+		np->err_cnt = 0;
+	}
+	if (++np->err_cnt != NM32A_ERR_LIMIT || np->rx_off)
+		return;
+
+	np->rx_off = true;
+	cwr(p, chip, CAR, chan);
+	cwr(p, chip, IER, 0x01);		/* TxD only: 0x08 is RxD */
+	pr_warn(DRV ": ttyNM%u: %u receive exceptions in one second "
+		"(RISRl=%02x); muting the receiver -- is anything cabled to "
+		"this port?\n", chip * 4 + chan, np->err_cnt, risr);
+}
+
+/*
+ * End an interrupt service, and CONFIRM the context actually popped.
+ *
+ * STK (0xE2) is a 4-deep nesting stack whose bits 7 and 0 are CLvl[1:0], the
+ * currently active interrupt level; it is pushed by the acknowledge and popped
+ * by the EOIR write.  The write does not always take on the first attempt --
+ * IOS re-issues it, polling STK, up to 100 times (0x403628a4..0x403628dc), and
+ * so do we.  Leaving a context open is not a small matter here: the next
+ * acknowledge nests onto it, the chip never answers, and the read stalls with
+ * the machine still in it.
+ */
+/*
+ * Re-issuing the EOIR is how IOS confirms the context popped, but a second
+ * write may also re-present FIFO data -- received text repeats its tail
+ * ("edgenos-4610 610 login:").  Switchable so the two can be compared.
+ */
+static int eoiretry = 1;
+module_param(eoiretry, int, 0644);
+MODULE_PARM_DESC(eoiretry, "1 = re-issue EOIR until STK pops (IOS behaviour)");
+
+static void nm32a_eoi(struct nm32a *p, unsigned chip, unsigned reg, u8 val)
+{
+	int i;
+
+	cwr(p, chip, reg, val);
+	if (!eoiretry)
+		return;
+	for (i = 0; i < 100; i++) {
+		if (!(crd(p, chip, STK) & 0x81))
+			return;			/* no level active: popped */
+		cwr(p, chip, reg, val);
+	}
+	pr_warn_ratelimited(DRV ": chip %u: interrupt context will not pop "
+			    "(STK=%02x)\n", chip, crd(p, chip, STK));
+}
+
+/*
+ * Services taken per chip per sweep.  Back-to-back services may re-enter the
+ * interrupt context before the chip has finished the previous EOIR, which shows
+ * up as received text repeating its tail; one per sweep spaces them out at the
+ * cost of throughput.  Switchable so the two can be compared on hardware.
+ */
+/*
+ * Spacing between consecutive RDR reads.
+ *
+ * Received text repeats its tail at the 16-byte service boundary -- a prompt
+ * arriving as "edgenos-4610 4610 login:" -- which is the FIFO read pointer
+ * failing to keep up with back-to-back PCI reads, so the last bytes are
+ * presented again on the next service.  A microsecond between reads costs
+ * 16us per full FIFO and nothing that matters at console rates.
+ */
+static int rdrus = 1;
+module_param(rdrus, int, 0644);
+MODULE_PARM_DESC(rdrus, "microseconds between consecutive RDR reads");
+
+static int burst = 32;
+module_param(burst, int, 0644);
+MODULE_PARM_DESC(burst, "services per chip per sweep");
+
+/* returns true if a service was performed -- the caller keeps draining */
+static bool nm32a_service(struct nm32a *p, unsigned chip)
 {
 	unsigned long flags;
 	struct nm32a_port *np;
-	u8 tir0, rir0, tir1, rir1;
-	u8 rxbuf[16];
+	u8 tir0, rir0, tir1, rir1, erisr, ackv, tirc, rirc;
+	unsigned ackaddr;
+	bool tr;
+	/*
+	 * RFOC is five bits, so the FIFO can present up to 31 characters; a
+	 * 16-byte buffer clamps the count and the rest is dropped when the
+	 * service ends.  That is why a 20-character prompt arrived as exactly
+	 * 16 bytes of otherwise perfect text.
+	 */
+	u8 rxbuf[32];
 	int i, room, cnt = 0;
 	bool did_rx = false;
 
-	spin_lock_irqsave(&p->hw_lock, flags);
+	mutex_lock(&p->hw_lock);
 
 	tir0 = crd(p, chip, TIR);
 	rir0 = crd(p, chip, RIR);
+
+	/*
+	 * Trace only PENDING passes.  Tracing every idle sweep printed at 9600
+	 * baud and slowed the loop by ~70x, which was enough to hide the bug
+	 * entirely -- two "successful" runs proved nothing but that a slow loop
+	 * survives.  An idle pass is not interesting; a request is.
+	 */
+	tr = trace > 0 && ((tir0 | rir0) & 0x80);
+	if (tr) {
+		trace--;
+		pr_info(DRV ": svc c%u: tir0=%02x rir0=%02x\n", chip, tir0, rir0);
+	}
 	if (!((tir0 | rir0) & 0x80)) {		/* nothing pending */
-		spin_unlock_irqrestore(&p->hw_lock, flags);
-		return;
+		mutex_unlock(&p->hw_lock);
+		return false;
 	}
 
-	__raw_readb(p->bar + NM32A_ACK);	/* the one acknowledge (§108) */
+	/*
+	 * CONFIRM the request before acknowledging it.
+	 *
+	 * The acknowledge is an IACK bus cycle, and it is only legal while the
+	 * chip actually has a service to grant.  Acknowledge a request that has
+	 * already gone away and nothing answers the cycle: the read never
+	 * retires and the CPU stalls inside the load, interrupts off.  That is
+	 * the failure this driver kept dying of -- a silent box, no oops, no
+	 * console, no softlockup detector, only a power cycle.
+	 *
+	 * It reproduced in seconds at a 1 ms poll interval and not at all when
+	 * tracing slowed the loop to ~70 ms, which is what a narrow timing
+	 * window looks like.  So require the request to be present in two
+	 * consecutive reads, and treat the second as authoritative.
+	 */
+	tirc = crd(p, chip, TIR);
+	rirc = crd(p, chip, RIR);
+	if (!((tir0 | rir0) & (tirc | rirc) & 0x80)) {
+		if (tr) pr_info(DRV ": svc c%u: request vanished, not acking\n", chip);
+		mutex_unlock(&p->hw_lock);
+		return false;
+	}
+	tir0 = tirc;
+	rir0 = rirc;
+
+	/*
+	 * Receive outranks transmit (datasheet 5.2.4.1), and the address we
+	 * present decides which one we are acknowledging.
+	 */
+	ackaddr = (rir0 & 0x80) ? NM32A_ACK_RX : NM32A_ACK_TX;
+	if (tr) pr_info(DRV ": svc c%u: ACK read at +%03x...\n", chip, ackaddr);
+	ackv = __raw_readb(p->bar + ackaddr);
+
+	if (tr) pr_info(DRV ": svc c%u: ACK returned %02x\n", chip, ackv);
 
 	tir1 = crd(p, chip, TIR);
 	rir1 = crd(p, chip, RIR);
+	if (tr) pr_info(DRV ": svc c%u: tir1=%02x rir1=%02x\n", chip, tir1, rir1);
 
-	if ((rir0 & 0x80) && !(rir1 & 0x80)) {
+	/*
+	 * Which service did we just get?  With all three PILRs equal the chip
+	 * arbitrates receive first (5.2.4.1), so a pending receive request IS
+	 * the granted service -- no need to infer it from which bit cleared.
+	 *
+	 * Getting this right matters beyond tidiness: the EOIR write is what
+	 * returns the chip to non-interrupt context, and it must match the type
+	 * acknowledged.  The old fallback ended EVERY unrecognised service with
+	 * TEOIR, so a receive service that did not clear as expected left the
+	 * receive context open for ever; the next acknowledge then nested onto
+	 * a context that never ended and stalled the bus.  Harmless while
+	 * receive interrupts were never successfully acknowledged -- which was
+	 * the state of this driver until the PILR fix.
+	 */
+	if (rir0 & 0x80) {
 		/* receive was granted */
-		unsigned chan = rir0 & 3;
+		unsigned chan = rir0 & 3;	/* Rcn[1:0] */
 
 		np = &p->ports[chip * 4 + chan];
-		cnt = crd(p, chip, RFOC) & 0x1f;
+
+		/*
+		 * RIR bits 3:2 are Rvct[1:0] and say WHICH receive service this
+		 * is (datasheet 9.5.2.x): 11 is good data, 00 is an exception.
+		 *
+		 * Worth stating plainly because this driver had it inverted, and
+		 * the inversion is expensive in both directions: treating good
+		 * data as an exception silences a working console, and treating
+		 * an exception as good data drains RFOC bytes out of an RDR that
+		 * has nothing to give, which stalls the bus cycle and takes the
+		 * machine down with no oops and no console output.
+		 *
+		 * On an exception, RISR carries the cause and the offending
+		 * character is discarded by ending the service with NoTrans
+		 * (REOIR bit 3) rather than by reading it out.
+		 */
+		if (tr) pr_info(DRV ": svc c%u: rx chan %u vct=%x\n",
+				chip, chan, (rir0 >> 2) & 3);
+
+		if ((rir0 & 0x0c) != 0x0c) {		/* exception, not data */
+			/*
+			 * Do NOT end this with NoTrans.
+			 *
+			 * The trace shows one good character per reply, then an
+			 * exception, then silence for the rest of the burst --
+			 * which is what discarding the FIFO would look like.
+			 * RISRl bit 7 is a timeout, and the datasheet is explicit
+			 * that a timeout has no character associated with it; the
+			 * error cases (overrun/parity/framing/break) DO have one
+			 * sitting in the FIFO.  So drain the offending character
+			 * when there is one, drop it in software, and end the
+			 * service normally -- leaving whatever else has arrived
+			 * alone.
+			 */
+			erisr = crd(p, chip, RISRl);
+			/*
+			 * A TIMEOUT is not an error -- it is the chip saying
+			 * "data stopped, come and collect what is left".  The
+			 * datasheet is explicit (5.3.5): the host is expected to
+			 * retrieve the characters still in the FIFO.  Discarding
+			 * it strands the tail of every burst shorter than the
+			 * threshold, which is why a 23-character prompt arrived
+			 * as exactly 16 bytes and "login: " never appeared.
+			 */
+			if (erisr & 0x01) st_break++;
+			if (erisr & 0x08) st_overrun++;
+			if (erisr & 0x80) {
+				st_timeout++;
+				cnt = crd(p, chip, RFOC) & 0x1f;
+				if (cnt > (int)sizeof(rxbuf))
+					cnt = sizeof(rxbuf);
+				for (i = 0; i < cnt; i++)
+					rxbuf[i] = crd(p, chip, RDR);
+				cnt = i;
+				nm32a_eoi(p, chip, REOIR, 0x00);
+				if (cnt > 0 && np->open) {
+					tty_insert_flip_string(&np->port, rxbuf, cnt);
+					tty_flip_buffer_push(&np->port);
+				}
+				mutex_unlock(&p->hw_lock);
+				return true;
+			}
+			if (tr)
+				pr_info(DRV ": svc c%u: RISRl=%02x [%s%s%s%s%s] RFOC=%d\n",
+					chip, erisr,
+					(erisr & 0x80) ? "timeout " : "",
+					(erisr & 0x08) ? "overrun " : "",
+					(erisr & 0x04) ? "parity " : "",
+					(erisr & 0x02) ? "framing " : "",
+					(erisr & 0x01) ? "break " : "",
+					crd(p, chip, RFOC) & 0x1f);
+			if (!(erisr & 0x80) && (crd(p, chip, RFOC) & 0x1f))
+				(void)crd(p, chip, RDR);	/* the bad char */
+			nm32a_eoi(p, chip, REOIR, 0x00);
+			nm32a_rx_exception(p, chip, chan, erisr);
+			mutex_unlock(&p->hw_lock);
+			return true;
+		}
+
+		cnt = crd(p, chip, RFOC) & 0x1f;	/* RxCt4..0, so <= 31 */
 		if (cnt > (int)sizeof(rxbuf))
 			cnt = sizeof(rxbuf);
-		for (i = 0; i < cnt; i++)
+		if (tr) pr_info(DRV ": svc c%u: RFOC=%d, draining\n", chip, cnt);
+		/*
+		 * Latch RFOC once and read exactly that many, as IOS does
+		 * (0x40362f18: one lbu of RFOC, then RDR in a loop).
+		 *
+		 * Re-checking RFOC between reads seems safer and is not: the
+		 * count lags the reads, so the guard permits an extra read past
+		 * the end and stale bytes come back as duplicated text -- a
+		 * prompt arriving as "edgenos-4610 610 login:".  The FIFO is 16
+		 * deep and RFOC is five bits, so the latched count is already
+		 * bounded by rxbuf.
+		 */
+		for (i = 0; i < cnt; i++) {
 			rxbuf[i] = crd(p, chip, RDR);
-		cwr(p, chip, REOIR, 0x00);
+			if (rdrus)
+				udelay(rdrus);
+		}
+		cnt = i;
+		st_good++; st_bytes += cnt;
+		if (tr && cnt > 0)
+			pr_info(DRV ": svc c%u: got %02x %02x %02x ('%c')\n", chip,
+				rxbuf[0], cnt > 1 ? rxbuf[1] : 0,
+				cnt > 2 ? rxbuf[2] : 0,
+				(rxbuf[0] >= 0x20 && rxbuf[0] < 0x7f) ? rxbuf[0] : '.');
+		nm32a_eoi(p, chip, REOIR, 0x00);
 		did_rx = true;
-	} else if ((tir0 & 0x80) && !(tir1 & 0x80)) {
+	} else {
 		/* transmit was granted */
 		unsigned chan = tir0 & 3;
 
 		np = &p->ports[chip * 4 + chan];
-		spin_lock(&np->lock);
+		spin_lock_irqsave(&np->lock, flags);
 		room = crd(p, chip, TFTC);
 		if (room > 16)
 			room = 16;
@@ -1508,20 +2030,18 @@ static void nm32a_service(struct nm32a *p, unsigned chip)
 			np->tail = (np->tail + 1) % NM32A_TXBUF;
 		}
 		if (!i)
-			cwr(p, chip, IER, 0x08);	/* idle: stop asking */
-		cwr(p, chip, TEOIR, i ? 0x00 : 0x08);
-		spin_unlock(&np->lock);
-	} else {
-		/* neither cleared: end the service without transferring */
-		cwr(p, chip, TEOIR, 0x08);
+			cwr(p, chip, IER, 0x28);	/* idle: stop asking to send */
+		nm32a_eoi(p, chip, TEOIR, i ? 0x00 : 0x08);
+		spin_unlock_irqrestore(&np->lock, flags);
 	}
 
-	spin_unlock_irqrestore(&p->hw_lock, flags);
+	mutex_unlock(&p->hw_lock);
 
 	if (did_rx && cnt > 0 && np->open) {
 		tty_insert_flip_string(&np->port, rxbuf, cnt);
 		tty_flip_buffer_push(&np->port);
 	}
+	return true;
 }
 
 static int nm32a_poll_thread(void *data)
@@ -1529,7 +2049,8 @@ static int nm32a_poll_thread(void *data)
 	struct nm32a *p = data;
 
 	while (!kthread_should_stop()) {
-		unsigned chip, active = 0;
+		unsigned chip, active = 0, svc;
+		bool worked = false;
 
 		for (chip = 0; chip < NM32A_CHIPS; chip++) {
 			unsigned c, busy = 0;
@@ -1541,12 +2062,58 @@ static int nm32a_poll_thread(void *data)
 				continue;		/* nothing open on this chip */
 			active++;
 			nm32a_arm_tx(p, chip);
-			nm32a_service(p, chip);
+			/*
+			 * Drain the chip, do not take one service per sweep.
+			 *
+			 * COR4 asks for a service per character, so at 115200 a
+			 * character lands every 87us while the sweep runs every
+			 * ~0.5ms -- one service per pass cannot keep up and the
+			 * 16-byte FIFO overruns.  It shows up as text with holes
+			 * punched through it ("Enablin  Enabling M: 2 GiB"),
+			 * which reads like a line fault rather than a driver too
+			 * slow to collect.  Keep servicing while the chip still
+			 * has something pending, bounded so a stuck request
+			 * cannot spin here for ever.
+			 */
+			for (svc = 0; svc < (unsigned)burst; svc++) {
+				if (!nm32a_service(p, chip))
+					break;
+				worked = true;
+			}
 		}
-		if (active)
-			usleep_range(1000, 2000);
-		else
+		/*
+		 * Only sleep once the card has gone quiet.
+		 *
+		 * 16-byte FIFO: at 115200 a character lands every 87us, so it
+		 * overflows in ~1.4ms.  Sleeping 500-1000us after a sweep that
+		 * just moved data is ~11 characters of headroom, and scheduling
+		 * jitter eats it -- which punches holes through the middle of
+		 * words and reads like a line fault.  If we just did work, go
+		 * straight round again and only yield the CPU.
+		 */
+		if (worked) {
+			cond_resched();
+		} else if (active) {
+			/*
+			 * udelay, not usleep_range.
+			 *
+			 * This kernel has CONFIG_HZ=250 and no HIGH_RES_TIMERS,
+			 * so usleep_range() cannot sleep less than a jiffy -- 4ms,
+			 * whatever range you ask for.  At 115200 that is ~46
+			 * characters against a 16-byte FIFO, so a burst overran
+			 * before the poll thread ever looked, and a 23-character
+			 * prompt arrived as exactly 16 bytes.  The "500-1000us"
+			 * in the old call was never what the machine did.
+			 *
+			 * A busy wait is honest here: 200us keeps us well inside
+			 * the 1.4ms the FIFO gives us, and cond_resched() keeps
+			 * the box responsive under PREEMPT_NONE.
+			 */
+			udelay(polldelay);
+			cond_resched();
+		} else {
 			msleep(50);
+		}
 	}
 	return 0;
 }
@@ -1563,26 +2130,56 @@ static int nm32a_poll_thread(void *data)
 static int nm32a_port_activate(struct tty_port *port, struct tty_struct *tty)
 {
 	struct nm32a_port *np = container_of(port, struct nm32a_port, port);
-	unsigned long flags;
+	unsigned rate;
 
-	spin_lock_irqsave(&np->card->hw_lock, flags);
-	nm32a_chan_init(np->card, np->chip, np->chan, 9600);
+	mutex_lock(&np->card->hw_lock);
+	/*
+	 * Refuse the open if the chip is not running its microcode: GFRCR still
+	 * reading the silicon revision means the download never took, and the
+	 * channel commands below would simply time out.  Failing here gives the
+	 * caller an error instead of a port that accepts writes and drops them.
+	 */
+	if (crd(np->card, np->chip, GFRCR) == 0xE0) {
+		mutex_unlock(&np->card->hw_lock);
+		pr_warn(DRV ": chip %u has no microcode; refusing open of ttyNM%u\n",
+			np->chip, np->chip * 4 + np->chan);
+		return -ENODEV;
+	}
+	if (trace > 0)
+		pr_info(DRV ": ttyNM%u: activate: chan_init...\n",
+			np->chip * 4 + np->chan);
+	/*
+	 * Program the rate the TTY LAYER holds, not a hardcoded one.
+	 *
+	 * ->activate runs on every open, so hardcoding 9600 here quietly undid
+	 * every stty: the chip went back to 9600 while the tty layer still
+	 * believed the speed it had been given.  Reading a 115200 console then
+	 * produces a steady stream of plausible-looking garbage, which is easy
+	 * to mistake for a protocol bug -- and was.
+	 */
+	rate = tty ? tty_get_baud_rate(tty) : 0;
+	nm32a_chan_init(np->card, np->chip, np->chan, rate ? rate : 9600);
+	if (trace > 0)
+		pr_info(DRV ": ttyNM%u: activate: chan_init done\n",
+			np->chip * 4 + np->chan);
 	np->head = np->tail = 0;
+	np->err_cnt = 0;
+	np->err_win = jiffies;
+	np->rx_off = false;
 	np->open = true;
-	spin_unlock_irqrestore(&np->card->hw_lock, flags);
+	mutex_unlock(&np->card->hw_lock);
 	return 0;
 }
 
 static void nm32a_port_shutdown(struct tty_port *port)
 {
 	struct nm32a_port *np = container_of(port, struct nm32a_port, port);
-	unsigned long flags;
 
-	spin_lock_irqsave(&np->card->hw_lock, flags);
+	mutex_lock(&np->card->hw_lock);
 	np->open = false;
 	cwr(np->card, np->chip, CAR, np->chan);
 	cwr(np->card, np->chip, IER, 0x00);	/* stop asking for service */
-	spin_unlock_irqrestore(&np->card->hw_lock, flags);
+	mutex_unlock(&np->card->hw_lock);
 }
 
 static const struct tty_port_operations nm32a_port_ops = {
@@ -1660,11 +2257,10 @@ static void nm32a_tty_set_termios(struct tty_struct *tty,
 {
 	struct nm32a_port *np = tty->driver_data;
 	unsigned rate = tty_get_baud_rate(tty);
-	unsigned long flags;
 
 	if (!np)
 		return;
-	spin_lock_irqsave(&np->card->hw_lock, flags);
+	mutex_lock(&np->card->hw_lock);
 	cwr(np->card, np->chip, CAR, np->chan);
 	nm32a_set_rate(np->card, np->chip, rate ? rate : 9600);
 	cwr(np->card, np->chip, CCR, CCR_INITCH);
@@ -1672,7 +2268,7 @@ static void nm32a_tty_set_termios(struct tty_struct *tty,
 	cwr(np->card, np->chip, CCR, CCR_ENTX | CCR_ENRX);
 	ccr_wait(np->card, np->chip);
 	cwr(np->card, np->chip, IER, 0x09);
-	spin_unlock_irqrestore(&np->card->hw_lock, flags);
+	mutex_unlock(&np->card->hw_lock);
 }
 
 static const struct tty_operations nm32a_tty_ops = {
@@ -1766,7 +2362,7 @@ static int nm32a_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 * Nothing else here: probe must leave the card exactly as it was found,
 	 * so the state IOS left behind can be read with stage 0.
 	 */
-	spin_lock_init(&p->hw_lock);
+	mutex_init(&p->hw_lock);
 
 	/* microcode into all eight chips -- without it nothing responds (§95) */
 	for (rc = 0; rc < NM32A_CHIPS; rc++)

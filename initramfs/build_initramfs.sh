@@ -102,6 +102,17 @@ exec </dev/console >/dev/console 2>&1
 # surprise anything expecting 127.0.0.1 to work, and it costs one line.
 /bin/busybox ip link set lo up 2>/dev/null
 
+# Resilience.  This box serves 32 consoles unattended, so a panic that sits
+# waiting for someone at the power strip is the wrong failure mode -- reboot and
+# come back instead.  An oops is promoted to a panic for the same reason: an
+# oops in the NM-32A poll thread otherwise leaves a half-working machine, ttys
+# registered but nothing servicing them.
+#
+# Set here rather than relying on CONFIG_CMDLINE: a value you can read back from
+# /proc/sys is worth more than one you have to trust.
+/bin/busybox echo 10 > /proc/sys/kernel/panic          2>/dev/null
+/bin/busybox echo 1  > /proc/sys/kernel/panic_on_oops  2>/dev/null
+
 # NM-32A: the driver does the hardware at probe (microcode into all eight
 # CD2481s, 32 ttys, poll thread).  All that is left is the network and the
 # console server, so a freshly booted box answers on TCP 2000+port with no

@@ -171,7 +171,7 @@ Writing the same value to both gives you two different rates.
   tty layer
       |  tty_port ops / flip buffers
       v
-  nm32a driver  --  poll thread, 1 ms while a port is open
+  nm32a driver  --  poll thread, 50 us while a port is open
       |  BAR0 register access + acknowledge cycle at BAR+0
       v
   XC4013E FPGA  (PCI target, local bus master to the UARTs)
