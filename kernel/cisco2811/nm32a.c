@@ -1766,7 +1766,7 @@ static void nm32a_rx_exception(struct nm32a *p, unsigned chip, unsigned chan,
 /*
  * Re-issuing the EOIR is how IOS confirms the context popped, but a second
  * write may also re-present FIFO data -- received text repeats its tail
- * ("edgenos-4610 610 login:").  Switchable so the two can be compared.
+ * ("switch login: 610 login:").  Switchable so the two can be compared.
  */
 static int eoiretry = 1;
 module_param(eoiretry, int, 0644);
@@ -1798,7 +1798,7 @@ static void nm32a_eoi(struct nm32a *p, unsigned chip, unsigned reg, u8 val)
  * Spacing between consecutive RDR reads.
  *
  * Received text repeats its tail at the 16-byte service boundary -- a prompt
- * arriving as "edgenos-4610 4610 login:" -- which is the FIFO read pointer
+ * arriving as "switch login: 4610 login:" -- which is the FIFO read pointer
  * failing to keep up with back-to-back PCI reads, so the last bytes are
  * presented again on the next service.  A microsecond between reads costs
  * 16us per full FIFO and nothing that matters at console rates.
@@ -1998,7 +1998,7 @@ static bool nm32a_service(struct nm32a *p, unsigned chip)
 		 * Re-checking RFOC between reads seems safer and is not: the
 		 * count lags the reads, so the guard permits an extra read past
 		 * the end and stale bytes come back as duplicated text -- a
-		 * prompt arriving as "edgenos-4610 610 login:".  The FIFO is 16
+		 * prompt arriving as "switch login: 610 login:".  The FIFO is 16
 		 * deep and RFOC is five bits, so the latched count is already
 		 * bounded by rxbuf.
 		 */
@@ -2127,6 +2127,38 @@ static int nm32a_poll_thread(void *data)
  * per first open, under port->mutex, which is exactly the lifetime the hardware
  * setup should follow.
  */
+/*
+ * Raise or lower DTR/RTS.
+ *
+ * MSVR bit 1 is DTR and bit 0 is RTS, and writing the MSVR-DTR / MSVR-RTS
+ * registers drives the outputs (datasheet 9.4.4).
+ *
+ * This matters more than it looks.  A serial login prompt comes from a getty on
+ * the far end, and a getty resets and reprints when it sees a HANGUP -- DTR
+ * dropping.  This driver used to raise DTR/RTS at channel init and never lower
+ * them, so closing a console session signalled nothing: the far end went on
+ * believing the session was still up, and the login prompt never came back
+ * without power-cycling the attached device.  Wiring this into ->dtr_rts lets
+ * the tty layer hang the line up on the last close, as every other serial
+ * driver does.
+ */
+static void nm32a_set_mctrl(struct nm32a *p, unsigned chip, unsigned chan,
+			    bool active)
+{
+	cwr(p, chip, CAR, chan);
+	cwr(p, chip, MSVR_DTR, active ? 0x02 : 0x00);
+	cwr(p, chip, MSVR_RTS, active ? 0x01 : 0x00);
+}
+
+static void nm32a_dtr_rts(struct tty_port *port, bool active)
+{
+	struct nm32a_port *np = container_of(port, struct nm32a_port, port);
+
+	mutex_lock(&np->card->hw_lock);
+	nm32a_set_mctrl(np->card, np->chip, np->chan, active);
+	mutex_unlock(&np->card->hw_lock);
+}
+
 static int nm32a_port_activate(struct tty_port *port, struct tty_struct *tty)
 {
 	struct nm32a_port *np = container_of(port, struct nm32a_port, port);
@@ -2179,11 +2211,18 @@ static void nm32a_port_shutdown(struct tty_port *port)
 	np->open = false;
 	cwr(np->card, np->chip, CAR, np->chan);
 	cwr(np->card, np->chip, IER, 0x00);	/* stop asking for service */
+	/*
+	 * Hang the line up.  Without this the far end never learns the session
+	 * ended, so its getty sits there and no fresh login prompt appears --
+	 * which looked like "the console needs a reboot to come back".
+	 */
+	nm32a_set_mctrl(np->card, np->chip, np->chan, false);
 	mutex_unlock(&np->card->hw_lock);
 }
 
 static const struct tty_port_operations nm32a_port_ops = {
 	.activate = nm32a_port_activate,
+	.dtr_rts  = nm32a_dtr_rts,
 	.shutdown = nm32a_port_shutdown,
 };
 

@@ -124,6 +124,18 @@ if [ -c /dev/ttyNM0 ]; then
     /bin/busybox ip addr add "$NM_ADDR" dev eth0 2>/dev/null
     /bin/busybox ip link set eth0 up 2>/dev/null
     /bin/busybox ip route add default via "$NM_GW" 2>/dev/null
+    # The second onboard port (Fa0/1 -> eth1).  Set NM1_ADDR/NM1_GW to use it;
+    # its interrupt bit is confirmed working, and it carries IPv4 and IPv6.
+    if [ -n "$NM1_ADDR" ]; then
+        /bin/busybox ip addr add "$NM1_ADDR" dev eth1 2>/dev/null
+        [ -n "$NM1_ADDR6" ] && /bin/busybox ip -6 addr add "$NM1_ADDR6" dev eth1 2>/dev/null
+        /bin/busybox ip link set eth1 up 2>/dev/null
+        [ -n "$NM1_GW" ] && /bin/busybox ip route add default via "$NM1_GW" dev eth1 2>/dev/null
+    fi
+
+    # If you move the default route to eth1, remember anything only reachable
+    # through the eth0 gateway needs its own route, or you will lose it:
+    #   ip route add <net>/<len> via "$NM_GW" dev eth0
     /bin/nmconsole --base 2000 --ports 32 --speed 9600 >/nmconsole.log 2>&1 &
     /bin/busybox echo " NM-32A: 32 console ports on TCP 2000-2031 (port 16 = 2016)"
 fi

@@ -157,3 +157,35 @@ datasheet contained the answer each time.  In particular:
 * **Check the platform's assumptions, not just the device's.**  Four register
   theories were built on top of a sleep that was eight times longer than the
   code requested.
+
+## Hanging up, and what the far end does with a BREAK
+
+The driver raised DTR/RTS at channel init and never lowered them, so closing a
+console session signalled nothing to the attached device.  A getty resets and
+reprints its login prompt when DTR drops; ours never dropped, so a stale session
+on the far end looked like the console needing a power cycle to recover.
+`->dtr_rts` is implemented now and the last close lowers both lines.
+
+That cannot help a device on a three-wire console cable (TX/RX/ground, no modem
+leads) -- the vendor firmware reports `noCTS noDSR` on such a port and DTR never
+reaches the far end.  There, a newline is the recovery.
+
+Worth knowing before debugging a live console: **a getty commonly cycles through
+a list of speeds on BREAK.**  An attached device was found running at 57600 while
+its own `/proc/cmdline` said `console=ttyS0,115200`; nothing had been
+reconfigured.  Every mis-framed burst from this driver, while its receive path
+was still wrong, looked like a BREAK, and the getty stepped down its list.
+Emitting breaks has that cost.
+
+## The second Ethernet port
+
+`eth1`'s interrupt bit was a reasoned guess -- bit 32 was measured for port 0,
+and port 1 predicted as the next bit.  With the port finally cabled it
+negotiates 100 Mb/s full duplex and carries IPv4 and IPv6 in both directions, so
+the prediction holds.
+
+One trap: with the interface up and the far end quiet, `rx_packets` sat at 0 and
+`rx_errors` at 0, which is indistinguishable from a wrong receive interrupt.  A
+switch port will hold carrier while forwarding nothing at all.  Pinging the
+gateway settled it in one command -- an idle counter is not a broken one.
+

@@ -133,12 +133,19 @@ static struct platform_device c2811_eth0_device = {
  * The MAC follows Fa0/0's from the board's own block rather than being
  * invented: Cisco allocates consecutive addresses to the onboard ports.
  *
- * The interrupt bit is a reasoned guess, not a measurement.  Bit 32 was
- * confirmed as port 0 by watching the cause register while the port was
+ * The interrupt bit was a reasoned guess and is now CONFIRMED.  Bit 32 was
+ * established as port 0 by watching the cause register while the port was
  * pinged; the old PowerPC mv64x60 PIC numbered the Ethernet ports
- * consecutively, so port 1 should be the next bit.  It has not been verified
- * on the wire, because this port has never been cabled here -- with the link
- * down the PHY should still be detected, which is the part worth checking.
+ * consecutively, so port 1 was predicted to be the next bit.  With Fa0/1
+ * finally cabled, the port negotiated 100 Mb/s full duplex and carried traffic
+ * in both directions over IPv4 and IPv6 -- so the prediction was right and
+ * receive genuinely works on this bit.
+ *
+ * Worth recording how that nearly read as a failure: with the interface up and
+ * the far end silent, rx_packets sat at 0 with rx_errors 0, which looks exactly
+ * like a wrong receive interrupt.  A switch port will hold carrier while
+ * forwarding nothing at all.  Only pinging the gateway proved the path; do not
+ * read an idle counter as a broken one.
  */
 static struct mv643xx_eth_platform_data c2811_eth1_pd = {
 	.shared		= &c2811_eth_shared_device,
