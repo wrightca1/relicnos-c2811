@@ -189,3 +189,47 @@ One trap: with the interface up and the far end quiet, `rx_packets` sat at 0 and
 switch port will hold carrier while forwarding nothing at all.  Pinging the
 gateway settled it in one command -- an idle counter is not a broken one.
 
+## Sending a break
+
+A break is how you reach a Cisco supervisor's `rommon>` prompt, and how you
+unstick a getty that has stopped listening.  Two pieces were missing:
+
+The CD2481 has **no assert-break register bit**.  A break is an escape sequence
+embedded in the transmit stream (datasheet 7.5.4) and only works when **ETC**
+(COR2 bit 5) is enabled:
+
+    00 81   send BREAK        00 82 xx   lengthen it (xx * TPR tick)
+    00 83   stop BREAK        00 00      a literal NUL
+
+Enabling ETC has a cost: a real `0x00` in the outbound stream must now be sent
+as `00 00`, or it is read as the start of a command.  The write path escapes it.
+
+The console server was also discarding the request.  `nmconsole` swallowed
+`IAC BRK` in its generic two-byte-command case, so a telnet client's *Send
+Break* never reached the line -- useless on a console server.  It now calls
+`tcsendbreak()`, which reaches the driver through `->break_ctl`.
+
+**Status: implemented per the datasheet, not yet proven on the wire.**  A local
+self-test that watched the transmit pin (RCOR bit 7, TLVal) never caught the
+line low -- but that test is weak evidence: its first form wrote `TDR` from
+outside a transmit interrupt context, where the datasheet says writes go
+nowhere, and its second may be sampling the wrong channel, since the poll thread
+moves `CAR` continuously.  Treat the first real break as a test of the feature.
+
+## Remote access without the serial console
+
+`telnetd` (handing off to `/bin/login`) starts from `init`, so the board is
+reachable with no console cable attached.  Two things had to be fixed to make it
+work, each of which looked like something else:
+
+* **Sessions died the instant they connected.**  `/dev/ptmx` existed and
+  `CONFIG_UNIX98_PTYS` was set, but nothing mounted **devpts**, so no pty could
+  be allocated.
+* **`/etc/shadow` was owned by the build user**, because cpio preserves host
+  ownership; `/bin/login` will not trust it.  The image is now built with
+  `cpio -R 0:0`.
+
+Telnet is unencrypted.  The password in `build_initramfs.sh` is a speed bump
+against a passer-by, not protection against anyone watching the wire -- change
+it before the board goes anywhere that matters.
+

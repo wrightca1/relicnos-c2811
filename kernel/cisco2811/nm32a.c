@@ -432,7 +432,19 @@ static int nm32a_stage(struct nm32a *p, unsigned chip, unsigned chan, int stage)
 	cwr(p, chip, TBPR, 0x81);
 	cwr(p, chip, CMR,  0xC2);	/* RxMode=DMA | TxMode=DMA | async */
 	cwr(p, chip, COR1, 0x17);	/* 8 bits, no parity */
-	cwr(p, chip, COR2, 0x00);
+	/*
+	 * COR2 bit 5 is ETC -- Embedded Transmit Commands.  With it set, the
+	 * sequences below can be sent inside the data stream (datasheet 7.5.4):
+	 *
+	 *	00 81	send BREAK	00 82 xx  lengthen it (xx * TPR tick)
+	 *	00 83	stop BREAK	00 00	  a literal NUL
+	 *
+	 * The cost is that a real 0x00 in the outbound stream must now be sent
+	 * as 00 00, which nm32a_tty_write() does.  Without ETC there is no way
+	 * to raise a break at all, and a break is how you get a Cisco
+	 * supervisor's attention -- see the 4507R notes.
+	 */
+	cwr(p, chip, COR2, 0x20);		/* ETC: embedded transmit commands */
 	cwr(p, chip, COR3, 0x02);	/* 1 stop bit */
 	cwr(p, chip, COR4, 0x08);
 	cwr(p, chip, COR5, 0x00);
@@ -1766,7 +1778,7 @@ static void nm32a_rx_exception(struct nm32a *p, unsigned chip, unsigned chan,
 /*
  * Re-issuing the EOIR is how IOS confirms the context popped, but a second
  * write may also re-present FIFO data -- received text repeats its tail
- * ("switch login: 610 login:").  Switchable so the two can be compared.
+ * ("edgenos-4610 610 login:").  Switchable so the two can be compared.
  */
 static int eoiretry = 1;
 module_param(eoiretry, int, 0644);
@@ -1798,7 +1810,7 @@ static void nm32a_eoi(struct nm32a *p, unsigned chip, unsigned reg, u8 val)
  * Spacing between consecutive RDR reads.
  *
  * Received text repeats its tail at the 16-byte service boundary -- a prompt
- * arriving as "switch login: 4610 login:" -- which is the FIFO read pointer
+ * arriving as "edgenos-4610 4610 login:" -- which is the FIFO read pointer
  * failing to keep up with back-to-back PCI reads, so the last bytes are
  * presented again on the next service.  A microsecond between reads costs
  * 16us per full FIFO and nothing that matters at console rates.
@@ -1998,7 +2010,7 @@ static bool nm32a_service(struct nm32a *p, unsigned chip)
 		 * Re-checking RFOC between reads seems safer and is not: the
 		 * count lags the reads, so the guard permits an extra read past
 		 * the end and stale bytes come back as duplicated text -- a
-		 * prompt arriving as "switch login: 610 login:".  The FIFO is 16
+		 * prompt arriving as "edgenos-4610 610 login:".  The FIFO is 16
 		 * deep and RFOC is five bits, so the latched count is already
 		 * bounded by rxbuf.
 		 */
@@ -2249,6 +2261,48 @@ static void nm32a_tty_close(struct tty_struct *tty, struct file *f)
 		tty_port_close(&np->port, tty, f);
 }
 
+/* ring helpers -- callers hold np->lock */
+static unsigned nm32a_tx_space(struct nm32a_port *np)
+{
+	unsigned used = (np->head - np->tail + NM32A_TXBUF) % NM32A_TXBUF;
+
+	return NM32A_TXBUF - 1 - used;
+}
+
+static void nm32a_tx_put(struct nm32a_port *np, u8 c)
+{
+	np->tx[np->head] = c;
+	np->head = (np->head + 1) % NM32A_TXBUF;
+}
+
+/*
+ * Raise or drop a line break.
+ *
+ * The CD2481 has no "assert break" register bit; a break is an escape sequence
+ * embedded in the transmit stream, which is why ETC has to be enabled in COR2.
+ * The sequence is queued like data, so it takes effect once the FIFO drains to
+ * it -- a break is ordered with respect to what has already been sent, not
+ * immediate.
+ *
+ * Handle with care on this rack: a break on a Cisco console can drop a
+ * supervisor to rommon, and a break on a getty walks it down its speed list.
+ */
+static int nm32a_break_ctl(struct tty_struct *tty, int state)
+{
+	struct nm32a_port *np = tty->driver_data;
+	unsigned long flags;
+
+	if (!np)
+		return -ENODEV;
+	spin_lock_irqsave(&np->lock, flags);
+	if (nm32a_tx_space(np) >= 2) {
+		nm32a_tx_put(np, 0x00);
+		nm32a_tx_put(np, state ? 0x81 : 0x83);
+	}
+	spin_unlock_irqrestore(&np->lock, flags);
+	return 0;
+}
+
 static ssize_t nm32a_tty_write(struct tty_struct *tty, const u8 *buf, size_t n)
 {
 	struct nm32a_port *np = tty->driver_data;
@@ -2259,12 +2313,19 @@ static ssize_t nm32a_tty_write(struct tty_struct *tty, const u8 *buf, size_t n)
 		return -ENODEV;
 	spin_lock_irqsave(&np->lock, flags);
 	for (i = 0; i < n; i++) {
-		unsigned next = (np->head + 1) % NM32A_TXBUF;
+		/*
+		 * ETC is on, so 0x00 introduces an embedded command.  A literal
+		 * NUL therefore has to go out as 00 00, and it needs two free
+		 * slots or it must wait -- sending half of an escape would be
+		 * read as the start of a command.
+		 */
+		unsigned need = buf[i] ? 1 : 2;
 
-		if (next == np->tail)
+		if (nm32a_tx_space(np) < need)
 			break;
-		np->tx[np->head] = buf[i];
-		np->head = next;
+		nm32a_tx_put(np, buf[i]);
+		if (!buf[i])
+			nm32a_tx_put(np, 0x00);
 	}
 	spin_unlock_irqrestore(&np->lock, flags);
 	/*
@@ -2316,6 +2377,7 @@ static const struct tty_operations nm32a_tty_ops = {
 	.write		= nm32a_tty_write,
 	.write_room	= nm32a_tty_write_room,
 	.set_termios	= nm32a_tty_set_termios,
+	.break_ctl	= nm32a_break_ctl,
 };
 
 static int nm32a_tty_setup(struct nm32a *p)
@@ -2364,6 +2426,82 @@ static int nm32a_tty_setup(struct nm32a *p)
 		 p->tty->major);
 	return 0;
 }
+
+/*
+ * Prove a break actually reaches the wire, with nothing attached.
+ *
+ * RCOR bit 7 is TLVal, a read-only view of the transmit data pin.  A break
+ * holds TxD low for at least a character time, so TLVal reads 0 while it is
+ * asserted and 1 when the line returns to idle mark.  That is a complete
+ * verification without a far end -- which matters, because the obvious way to
+ * test a break is to send one at a live console, and on this rack that can drop
+ * a supervisor to rommon.
+ *
+ *	echo N > /sys/module/nm32a/parameters/sendbreak
+ */
+static int sendbreak_set(const char *val, const struct kernel_param *kp)
+{
+	struct nm32a *p = nm32a_dev;
+	struct nm32a_port *np;
+	unsigned port, chip, chan;
+	unsigned long flags;
+	int i, low = 0;
+	bool was_open;
+
+	if (!p || kstrtouint(val, 0, &port) || port >= NM32A_PORTS_N)
+		return -EINVAL;
+	chip = port / 4; chan = port % 4;
+	np = &p->ports[port];
+
+	/*
+	 * Queue the sequence in the RING, do not write TDR here.  TDR is a
+	 * virtual register and is only valid inside a transmit interrupt
+	 * context (datasheet 5.2.1); writing it from here goes nowhere, which
+	 * is exactly how the first version of this test "proved" that breaks
+	 * did not work.  The poll thread owns that context, so the port has to
+	 * look open for the duration.
+	 */
+	spin_lock_irqsave(&np->lock, flags);
+	was_open = np->open;
+	np->open = true;
+	if (nm32a_tx_space(np) >= 2) {
+		nm32a_tx_put(np, 0x00);
+		nm32a_tx_put(np, 0x81);		/* send break */
+	}
+	spin_unlock_irqrestore(&np->lock, flags);
+
+	/* let the poll thread transmit it, sampling the transmit pin as we go */
+	for (i = 0; i < 400; i++) {
+		mutex_lock(&p->hw_lock);
+		cwr(p, chip, CAR, chan);
+		if (!(crd(p, chip, RCOR) & 0x80))
+			low++;
+		mutex_unlock(&p->hw_lock);
+		udelay(200);
+	}
+
+	spin_lock_irqsave(&np->lock, flags);
+	if (nm32a_tx_space(np) >= 2) {
+		nm32a_tx_put(np, 0x00);
+		nm32a_tx_put(np, 0x83);		/* stop break */
+	}
+	spin_unlock_irqrestore(&np->lock, flags);
+	msleep(50);
+	spin_lock_irqsave(&np->lock, flags);
+	np->open = was_open;
+	spin_unlock_irqrestore(&np->lock, flags);
+
+	pr_info(DRV ": break test ttyNM%u: %d/400 samples saw TxD low -- %s\n",
+		port, low,
+		low ? "break REACHED THE WIRE" : "no break seen");
+	return 0;
+}
+
+static const struct kernel_param_ops sendbreak_ops = {
+	.set = sendbreak_set,
+};
+module_param_cb(sendbreak, &sendbreak_ops, NULL, 0644);
+MODULE_PARM_DESC(sendbreak, "port number: send a test break and report TLVal");
 
 static int nm32a_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {

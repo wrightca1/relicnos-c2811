@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: MIT
 /*
  * nmconsole -- reverse-telnet server for the NM-32A's 32 async ports.
  *
@@ -52,6 +51,8 @@ static int nports = MAXP, base_port = 2000, speed = 9600, raw_mode = 0;
 #define WONT 252
 #define WILL 251
 #define SB   250
+#define BRK  243	/* telnet Send Break */
+#define IP   244	/* Interrupt Process -- some clients send this instead */
 #define SE   240
 #define OPT_ECHO 1
 #define OPT_SGA  3
@@ -61,7 +62,7 @@ static int nports = MAXP, base_port = 2000, speed = 9600, raw_mode = 0;
  * Any option the client asks us to enable is refused (WONT/DONT): a console
  * server has nothing to negotiate beyond the initial offer.
  */
-static int telnet_filter(int fd, unsigned char *b, int n)
+static int telnet_filter(int fd, int tty_fd, unsigned char *b, int n)
 {
 	int i, o = 0;
 
@@ -91,6 +92,23 @@ static int telnet_filter(int fd, unsigned char *b, int n)
 			i += 2;
 			break;
 		}
+		case BRK:
+		case IP:
+			/*
+			 * Send Break.  Without this the client's break request
+			 * is swallowed by the default case below and nothing
+			 * reaches the line -- which is useless on a console
+			 * server, since a break is how you get a Cisco
+			 * supervisor's attention (rommon) or a stuck getty's.
+			 *
+			 * tcsendbreak() goes through the tty layer to the
+			 * driver's ->break_ctl.  Deliberate breaks only: this is
+			 * the one path that should ever raise one.
+			 */
+			if (tty_fd >= 0)
+				tcsendbreak(tty_fd, 0);
+			i++;
+			break;
 		case SB:			/* skip to SE */
 			while (i + 1 < n && !(b[i] == IAC && b[i + 1] == SE))
 				i++;
@@ -284,6 +302,7 @@ int main(int argc, char **argv)
 				} else if (pt->tty_fd >= 0) {
 					if (!raw_mode)
 						n = telnet_filter(pt->client_fd,
+								  pt->tty_fd,
 								  (unsigned char *)buf, n);
 					if (n > 0)
 						(void)!write(pt->tty_fd, buf, n);

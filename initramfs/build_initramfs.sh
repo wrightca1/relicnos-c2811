@@ -23,6 +23,19 @@ file "$BB" | grep -q 'statically linked' || echo "WARNING: busybox is not static
 cd "$(dirname "$0")"
 OUT=initramfs_root
 rm -rf "$OUT" && mkdir -p "$OUT"/{bin,sbin,dev,proc,sys,etc,mnt}
+
+# Accounts, so telnetd can hand off to /bin/login rather than dropping straight
+# to a root shell.  CHANGE THIS before putting the box anywhere you care about:
+# telnet is unencrypted, so the password is a speed bump against a passer-by,
+# not protection against anyone watching the wire.
+ROOT_PW_HASH="$6$sZLqI3TMZ66QR0i6$s.CDLmpT/XmPe68lYDaDKndoPXPvMGC.viw7TnDi2L8ESAyBun.OQlrLgJ4JveFYsPLyCi1hG1EXmZvFZGM0J0"          # "relicnos" -- regenerate with: openssl passwd -6
+cat > "$OUT/etc/passwd" <<'PW'
+root:x:0:0:root:/:/bin/sh
+PW
+printf 'root:%s:19000:0:99999:7:::\n' "$ROOT_PW_HASH" > "$OUT/etc/shadow"
+printf 'root:x:0:\n' > "$OUT/etc/group"
+printf '/bin/sh\n'   > "$OUT/etc/shells"
+chmod 600 "$OUT/etc/shadow"
 cp "$BB" "$OUT/bin/busybox"
 # A minimal set, enough for init itself to run before busybox installs the rest.
 # Everything else is symlinked at boot by `busybox --install -s` (see init), which
@@ -74,6 +87,10 @@ export PATH=/bin:/sbin
 /bin/busybox mount -t proc     proc /proc
 /bin/busybox mount -t sysfs    sys  /sys
 /bin/busybox mount -t devtmpfs dev  /dev
+# telnetd needs a pty per session; without devpts it accepts the connection and
+# drops it at once, which reads as a broken service rather than a missing mount.
+/bin/busybox mkdir -p /dev/pts
+/bin/busybox mount -t devpts devpts /dev/pts
 # Reopen stdio on the console. An initramfs has no /dev/console at exec time (the
 # kernel only auto-mounts devtmpfs on the non-initramfs path, and a cpio built by a
 # normal user cannot carry device nodes), so init starts with fds 0/1/2 CLOSED and
@@ -136,6 +153,10 @@ if [ -c /dev/ttyNM0 ]; then
     # If you move the default route to eth1, remember anything only reachable
     # through the eth0 gateway needs its own route, or you will lose it:
     #   ip route add <net>/<len> via "$NM_GW" dev eth0
+    # A shell that does not depend on the serial console being plugged in.
+    # Unencrypted -- see the account note at the top of this script.
+    /bin/busybox telnetd -l /bin/login >/dev/null 2>&1 &
+
     /bin/nmconsole --base 2000 --ports 32 --speed 9600 >/nmconsole.log 2>&1 &
     /bin/busybox echo " NM-32A: 32 console ports on TCP 2000-2031 (port 16 = 2016)"
 fi
@@ -179,5 +200,5 @@ chmod +x "$OUT/bin/bootios"
 
 chmod +x "$OUT/init"
 
-( cd "$OUT" && find . -print0 | cpio --null -o -H newc 2>/dev/null | gzip -9 ) > initramfs.cpio.gz
+( cd "$OUT" && find . -print0 | cpio --null -o -H newc -R 0:0 2>/dev/null | gzip -9 ) > initramfs.cpio.gz
 echo "wrote initramfs.cpio.gz ($(du -h initramfs.cpio.gz | cut -f1))"
