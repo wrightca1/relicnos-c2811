@@ -1778,7 +1778,7 @@ static void nm32a_rx_exception(struct nm32a *p, unsigned chip, unsigned chan,
 /*
  * Re-issuing the EOIR is how IOS confirms the context popped, but a second
  * write may also re-present FIFO data -- received text repeats its tail
- * ("edgenos-4610 610 login:").  Switchable so the two can be compared.
+ * ("switch 610 login:").  Switchable so the two can be compared.
  */
 static int eoiretry = 1;
 module_param(eoiretry, int, 0644);
@@ -1810,7 +1810,7 @@ static void nm32a_eoi(struct nm32a *p, unsigned chip, unsigned reg, u8 val)
  * Spacing between consecutive RDR reads.
  *
  * Received text repeats its tail at the 16-byte service boundary -- a prompt
- * arriving as "edgenos-4610 4610 login:" -- which is the FIFO read pointer
+ * arriving as "switch 4610 login:" -- which is the FIFO read pointer
  * failing to keep up with back-to-back PCI reads, so the last bytes are
  * presented again on the next service.  A microsecond between reads costs
  * 16us per full FIFO and nothing that matters at console rates.
@@ -2010,7 +2010,7 @@ static bool nm32a_service(struct nm32a *p, unsigned chip)
 		 * Re-checking RFOC between reads seems safer and is not: the
 		 * count lags the reads, so the guard permits an extra read past
 		 * the end and stale bytes come back as duplicated text -- a
-		 * prompt arriving as "edgenos-4610 610 login:".  The FIFO is 16
+		 * prompt arriving as "switch 610 login:".  The FIFO is 16
 		 * deep and RFOC is five bits, so the latched count is already
 		 * bounded by rxbuf.
 		 */
