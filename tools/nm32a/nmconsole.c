@@ -18,6 +18,8 @@
  * going the other way.  --raw turns all of that off for netcat-style use.
  *
  *   nmconsole [--base 2000] [--ports 32] [--speed 9600] [--raw]
+ *             [--port-speed N:BAUD]...   one port, repeatable
+ *             [--speeds FILE]            a table of them
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +45,48 @@ struct port {
 
 static struct port ports[MAXP];
 static int nports = MAXP, base_port = 2000, speed = 9600, raw_mode = 0;
+
+/*
+ * Per-port speed.  A console server on a mixed rack needs this: an AS4610
+ * console runs at 115200 while a Catalyst supervisor defaults to 9600, and one
+ * global rate makes one of them unreadable.  -1 means "use the global default".
+ *
+ * open_tty() used to force the global speed onto every port each time it opened
+ * one, so an stty set by hand was silently undone on the next client connect.
+ */
+static int port_speed[MAXP];
+
+static void set_port_speed(int n, int baud)
+{
+	if (n >= 0 && n < MAXP)
+		port_speed[n] = baud;
+}
+
+/*
+ * Read a speed table:  <port> <baud>   # comment
+ * Port numbers are tty/TCP indices (0-31), i.e. TCP 2000+n.  Note the physical
+ * breakout is 1-based: breakout port N is index N-1.
+ */
+static int load_speed_conf(const char *path)
+{
+	char line[128];
+	int n, baud, count = 0;
+	FILE *f = fopen(path, "r");
+
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof(line), f)) {
+		char *h = strchr(line, '#');
+		if (h)
+			*h = 0;
+		if (sscanf(line, "%d %d", &n, &baud) == 2) {
+			set_port_speed(n, baud);
+			count++;
+		}
+	}
+	fclose(f);
+	return count;
+}
 
 /* telnet protocol, RFC 854 */
 #define IAC  255
@@ -167,9 +211,11 @@ static int open_tty(int n)
 	if (fd < 0)
 		return -1;
 	if (!tcgetattr(fd, &t)) {
+		int b = (port_speed[n] > 0) ? port_speed[n] : speed;
+
 		cfmakeraw(&t);
-		cfsetispeed(&t, to_speed(speed));
-		cfsetospeed(&t, to_speed(speed));
+		cfsetispeed(&t, to_speed(b));
+		cfsetospeed(&t, to_speed(b));
 		t.c_cflag |= CLOCAL | CREAD;
 		t.c_cflag &= ~CRTSCTS;
 		tcsetattr(fd, TCSANOW, &t);
@@ -208,6 +254,12 @@ int main(int argc, char **argv)
 			nports = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--speed") && i + 1 < argc)
 			speed = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--port-speed") && i + 1 < argc) {
+			int n, b;                       /* --port-speed 0:115200 */
+			if (sscanf(argv[++i], "%d:%d", &n, &b) == 2)
+				set_port_speed(n, b);
+		} else if (!strcmp(argv[i], "--speeds") && i + 1 < argc)
+			load_speed_conf(argv[++i]);
 		else if (!strcmp(argv[i], "--raw"))
 			raw_mode = 1;
 	}

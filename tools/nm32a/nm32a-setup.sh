@@ -1,5 +1,4 @@
 #!/bin/sh
-# SPDX-License-Identifier: MIT
 # NM-32A bring-up and console server, for relicnos on the Cisco 2811.
 #
 # Everything the card needs is done by the kernel driver at probe: microcode
@@ -46,10 +45,23 @@ case "$1" in
 status|"")
     status
     ;;
+speeds)
+    # what nmconsole will apply on the next open, as opposed to what stty says
+    # right now -- the two differ until a port is reopened.
+    echo "== configured per-port speeds (/etc/nmconsole.speeds) =="
+    if [ -r /etc/nmconsole.speeds ]; then
+        cat /etc/nmconsole.speeds
+    else
+        echo "  none -- every port uses nmconsole's global --speed"
+    fi
+    ;;
 speed)
     [ -n "$2" ] && [ -n "$3" ] || usage
     # the driver maps the rate onto ClkSel/BPR; see nm32a.c.  9600 and below
     # live on clk1 because clk0 cannot express them in an 8-bit divisor.
+    # This lasts until the port is next reopened; nmconsole reapplies its own
+    # table on open.  To make it stick, add the port to /etc/nmconsole.speeds
+    # (baked in by build_initramfs.sh) and rebuild.
     stty -F /dev/ttyNM"$2" "$3" raw -echo
     echo "port $2 set to $3 baud"
     stty -F /dev/ttyNM"$2" | head -2

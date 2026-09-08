@@ -36,6 +36,16 @@ printf 'root:%s:19000:0:99999:7:::\n' "$ROOT_PW_HASH" > "$OUT/etc/shadow"
 printf 'root:x:0:\n' > "$OUT/etc/group"
 printf '/bin/sh\n'   > "$OUT/etc/shells"
 chmod 600 "$OUT/etc/shadow"
+
+# Per-port console speeds.  One global rate rarely fits a rack: a modern switch
+# console is often 115200 while older gear defaults to 9600.  Indices are
+# tty/TCP (0-31, served on TCP 2000+n).  If your breakout is numbered from 1,
+# physical port N is index N-1.
+cat > "$OUT/etc/nmconsole.speeds" <<'SPD'
+# port  baud    # what is attached
+#0      115200
+#1      9600
+SPD
 cp "$BB" "$OUT/bin/busybox"
 # A minimal set, enough for init itself to run before busybox installs the rest.
 # Everything else is symlinked at boot by `busybox --install -s` (see init), which
@@ -157,7 +167,8 @@ if [ -c /dev/ttyNM0 ]; then
     # Unencrypted -- see the account note at the top of this script.
     /bin/busybox telnetd -l /bin/login >/dev/null 2>&1 &
 
-    /bin/nmconsole --base 2000 --ports 32 --speed 9600 >/nmconsole.log 2>&1 &
+    /bin/nmconsole --base 2000 --ports 32 --speed 9600 \
+                   --speeds /etc/nmconsole.speeds >/nmconsole.log 2>&1 &
     /bin/busybox echo " NM-32A: 32 console ports on TCP 2000-2031 (port 16 = 2016)"
 fi
 # Respawn the shell instead of exec'ing it.  With `exec` the shell IS pid 1, so

@@ -182,3 +182,23 @@ Writing the same value to both gives you two different rates.
       v
   RS-232 on the octal cable  ---->  the attached console
 ```
+
+## Per-port console speeds
+
+A console server on a mixed rack needs a rate per port: a modern switch console
+is often 115200 while older gear defaults to 9600, and one global setting makes
+one of them unreadable.
+
+```sh
+nmconsole --base 2000 --ports 32 --speed 9600 --speeds /etc/nmconsole.speeds
+nmconsole --port-speed 0:115200 --port-speed 1:9600 ...
+```
+
+`/etc/nmconsole.speeds` is a table of `<port> <baud>` lines, indices being
+tty/TCP (0-31, served on TCP 2000+n). If your breakout is numbered from 1,
+physical port N is index N-1.
+
+Note that `stty` alone does not hold: nmconsole applies the table each time it
+opens a tty, so a hand-set rate is undone the next time a client connects. Put
+it in the table instead.
+
