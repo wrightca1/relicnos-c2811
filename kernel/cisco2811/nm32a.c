@@ -442,7 +442,7 @@ static int nm32a_stage(struct nm32a *p, unsigned chip, unsigned chan, int stage)
 	 * The cost is that a real 0x00 in the outbound stream must now be sent
 	 * as 00 00, which nm32a_tty_write() does.  Without ETC there is no way
 	 * to raise a break at all, and a break is how you get a Cisco
-	 * supervisor's attention -- see the 4507R notes.
+	 * supervisor's attention, or a stuck getty's.
 	 */
 	cwr(p, chip, COR2, 0x20);		/* ETC: embedded transmit commands */
 	cwr(p, chip, COR3, 0x02);	/* 1 stop bit */

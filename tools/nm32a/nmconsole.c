@@ -47,8 +47,8 @@ static struct port ports[MAXP];
 static int nports = MAXP, base_port = 2000, speed = 9600, raw_mode = 0;
 
 /*
- * Per-port speed.  A console server on a mixed rack needs this: an AS4610
- * console runs at 115200 while a Catalyst supervisor defaults to 9600, and one
+ * Per-port speed.  A console server on a mixed rack needs this: a modern switch
+ * console often runs at 115200 while older gear defaults to 9600, and one
  * global rate makes one of them unreadable.  -1 means "use the global default".
  *
  * open_tty() used to force the global speed onto every port each time it opened
