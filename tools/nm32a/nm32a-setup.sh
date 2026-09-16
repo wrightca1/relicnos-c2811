@@ -71,7 +71,11 @@ start)
         echo "already running (pid $(pidof nmconsole))"; exit 0
     fi
     [ -c /dev/ttyNM0 ] || { echo "no /dev/ttyNM* -- did the driver probe?"; exit 1; }
-    nmconsole --base $BASE --ports 32 --speed "${2:-9600}" &
+    # --speeds must match init's invocation in build_initramfs.sh.  Without it a
+    # restart through this script silently drops every per-port rate back to the
+    # global default -- the exact silent revert the per-port table exists to stop.
+    nmconsole --base $BASE --ports 32 --speed "${2:-9600}" \
+              --speeds /etc/nmconsole.speeds &
     sleep 1
     pidof nmconsole >/dev/null 2>&1 && echo "started; port 16 is telnet <host> $((BASE+16))"
     ;;
