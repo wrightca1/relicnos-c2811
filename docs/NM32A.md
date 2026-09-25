@@ -123,10 +123,23 @@ before transmit before modem.  So the loop must be:
 ```
    read TIR, RIR                 what is pending?
    read BAR+0                    ONE acknowledge
-   read TIR, RIR again           which enable bit dropped?
-     receive granted  -> RFOC, then RDR x count, then REOIR
-     transmit granted -> TFTC, then TDR x n,     then TEOIR
+   read TIR, RIR again           which context is now ACTIVE?
+     RIR & 0xC0 == 0x40  -> receive:  RFOC, then RDR x count, then REOIR
+     TIR & 0xC0 == 0x40  -> transmit: TFTC, then TDR x n,     then TEOIR
 ```
+
+Ren/Ten (bit 7) clears on the acknowledge and Ract/Tact (bit 6) stays set until
+the EOIR, so an acknowledged service reads `0x40` in its top two bits (datasheet
+9.5.2.2 and 9.5.3.2). Decide the branch from that, from the read AFTER the
+acknowledge, and take the channel and vector from the same register.
+
+⚠ Deciding it from the read BEFORE the acknowledge is a race, and the driver did
+that until 2026-09-25. If only transmit is pending when you look and a byte
+arrives before the acknowledge, the chip grants receive (receive outranks
+transmit) while you service transmit. The receive context never ends, and that
+channel goes deaf in both directions until the card is power-cycled; reopening
+the tty does not reach it. `st_misgrant` counts the grants that differed from
+what was pending, and `st_nogrant` counts acknowledges that granted nothing.
 
 Acknowledging twice in one pass -- once "for transmit", once "for receive" --
 corrupts both directions, because the chip may grant receive when you assumed

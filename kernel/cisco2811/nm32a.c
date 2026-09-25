@@ -1592,6 +1592,15 @@ static void nm32a_set_rate(struct nm32a *p, unsigned chip, unsigned rate)
  * misled this investigation twice.  Counting is free; read them afterwards.
  */
 static unsigned long st_good, st_bytes, st_overrun, st_break, st_timeout, st_svc;
+/*
+ * Services the chip granted that were not the one the pre-acknowledge read
+ * pointed at -- the race nm32a_service() now decides by the post-acknowledge
+ * state instead of falling into. Nonzero is the race happening and being
+ * handled; before, each one silently deafened a port.
+ */
+static unsigned long st_misgrant, st_nogrant;
+module_param(st_misgrant, ulong, 0444);
+module_param(st_nogrant, ulong, 0444);
 module_param(st_good, ulong, 0644);
 module_param(st_bytes, ulong, 0644);
 module_param(st_overrun, ulong, 0644);
@@ -1902,20 +1911,70 @@ static bool nm32a_service(struct nm32a *p, unsigned chip)
 	if (tr) pr_info(DRV ": svc c%u: tir1=%02x rir1=%02x\n", chip, tir1, rir1);
 
 	/*
-	 * Which service did we just get?  With all three PILRs equal the chip
-	 * arbitrates receive first (5.2.4.1), so a pending receive request IS
-	 * the granted service -- no need to infer it from which bit cleared.
+	 * Which service did we just get?  Decided by what the chip SAYS it
+	 * granted, not by what was pending a moment earlier.
 	 *
-	 * Getting this right matters beyond tidiness: the EOIR write is what
-	 * returns the chip to non-interrupt context, and it must match the type
-	 * acknowledged.  The old fallback ended EVERY unrecognised service with
-	 * TEOIR, so a receive service that did not clear as expected left the
-	 * receive context open for ever; the next acknowledge then nested onto
-	 * a context that never ended and stalled the bus.  Harmless while
-	 * receive interrupts were never successfully acknowledged -- which was
-	 * the state of this driver until the PILR fix.
+	 * Datasheet 9.5.2.2 / 9.5.3.2: an acknowledged service reads Ren/Ten = 0
+	 * with Ract/Tact = 1 -- (RIR & 0xC0) == 0x40 -- from the acknowledge
+	 * until its EOIR. A request that is still waiting reads 0xC0 or 0x80.
+	 * So the post-acknowledge read names the granted context outright.
+	 *
+	 * ⚠ THIS USED TO BE DECIDED FROM rir0, THE PRE-ACKNOWLEDGE READ, and
+	 * that is a race. With the PILRs equal (pilr=0) every type is
+	 * acknowledged at the same address and the chip grants receive first,
+	 * so when only transmit was pending at the confirming read and a
+	 * received byte landed before the acknowledge, the chip granted RECEIVE
+	 * and this code took the transmit branch: it wrote TDR inside a receive
+	 * context and ended it with TEOIR. The receive context never ended, the
+	 * chip stopped requesting service for that channel, and the port went
+	 * deaf in both directions -- telnet negotiated, nothing ever arrived --
+	 * until the 2811 was power-cycled. Closing and reopening the tty runs
+	 * InitCh, which does not touch an open interrupt context.
+	 *
+	 * Seen three times in two days on one port, always under sustained
+	 * two-way traffic: a client sending a byte every ~100 ms into a shell
+	 * that answered each with a screen redraw, and a bootloader break-in
+	 * sent while the BIOS was printing. Exactly the overlap this window
+	 * needs.
+	 *
+	 * A context left open by the old code also reads as granted here, so
+	 * the next pass ends it properly: the fix recovers a stuck channel as
+	 * well as preventing one.
 	 */
-	if (rir0 & 0x80) {
+	{
+		bool rx_granted = (rir1 & 0xC0) == 0x40;
+		bool tx_granted = !rx_granted && (tir1 & 0xC0) == 0x40;
+		bool rx_expected = (rir0 & 0x80) != 0;
+
+		if (!rx_granted && !tx_granted) {
+			/*
+			 * Nothing acknowledged. Modem interrupts are never
+			 * enabled here (IER has no MdmCh), so this is not a
+			 * missed modem context; there is nothing to end.
+			 */
+			st_nogrant++;
+			pr_warn_ratelimited(DRV ": chip %u: acknowledge granted no "
+					    "service (tir %02x->%02x rir %02x->%02x)\n",
+					    chip, tir0, tir1, rir0, rir1);
+			mutex_unlock(&p->hw_lock);
+			return false;
+		}
+		if (rx_granted != rx_expected) {
+			st_misgrant++;
+			if (tr)
+				pr_info(DRV ": svc c%u: granted %s, expected %s "
+					"(tir %02x->%02x rir %02x->%02x)\n", chip,
+					rx_granted ? "rx" : "tx",
+					rx_expected ? "rx" : "tx",
+					tir0, tir1, rir0, rir1);
+		}
+		/* From here on the granted context's own register is the truth:
+		 * its channel and, for receive, its vector. */
+		rir0 = rx_granted ? rir1 : 0;
+		tir0 = tx_granted ? tir1 : tir0;
+	}
+
+	if (rir0) {
 		/* receive was granted */
 		unsigned chan = rir0 & 3;	/* Rcn[1:0] */
 

@@ -233,3 +233,26 @@ Telnet is unencrypted.  The password in `build_initramfs.sh` is a speed bump
 against a passer-by, not protection against anyone watching the wire -- change
 it before the board goes anywhere that matters.
 
+## A port that went deaf was a service the driver ended as the wrong type
+
+Symptom: one console goes silent in both directions and stays that way. A client
+connects, gets the telnet negotiation, and never receives a byte. Nothing is
+typed back, and the attached device's own output never arrives. Other ports on
+the card keep working, there is no mute message and no oops, and restarting
+nmconsole does not help. Only a cold power cycle of the router clears it. It
+happened under sustained two-way traffic: steady input into a device that echoed
+a screen redraw for every byte.
+
+Cause: `nm32a_service()` decided receive-or-transmit from the TIR/RIR read taken
+before the interrupt acknowledge. With the PILRs equal, one acknowledge serves
+every type and the chip grants receive first. So a byte arriving between that
+read and the acknowledge turned a transmit the driver expected into a receive
+the chip granted. The driver then wrote TDR into a receive context and ended it
+with TEOIR. The receive context never ended, the chip stopped asking for service
+on that channel, and InitCh on the next open does not touch an open interrupt
+context.
+
+Fix: take the branch, channel and vector from the post-acknowledge read, where
+the granted context is the one reading Ren=0/Ract=1 (0x40). A context left
+stranded by the old code reads the same way, so the fix also ends it on the next
+pass. Two counters make the race visible: `st_misgrant` and `st_nogrant`.
